@@ -2,14 +2,21 @@
  * High Availability Provider Extension for Pi
  * 
  * Automatically switches to fallback providers when quota is exhausted.
- * Supports multiple OAuth accounts for the same provider.
+ * Supports both API key and OAuth providers, with custom provider registration
+ * for multiple OAuth accounts per provider.
  */
 
 import type {
+  Api,
+  AssistantMessageEventStream,
+  Context,
   Model,
+  OAuthCredentials,
+  OAuthLoginCallbacks,
+  SimpleStreamOptions,
 } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { readFileSync, existsSync, writeFileSync, copyFileSync } from "fs";
+import { readFileSync, existsSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 
@@ -36,31 +43,36 @@ interface HaConfig {
   defaultGroup?: string;
   /** Global default cooldown (default: 1 hour = 3600000ms) */
   defaultCooldownMs?: number;
+  /** Custom OAuth provider definitions for backup accounts */
+  customProviders?: CustomProviderDefinition[];
 }
 
-/** Stored OAuth credentials for a backup account */
-interface BackupOAuthEntry {
-  /** Unique name for this backup (e.g., "gemini-backup-1") */
+interface CustomProviderDefinition {
+  /** Unique ID for this custom provider (e.g., "ha-gemini-backup-1") */
+  id: string;
+  /** Display name for login UI */
   name: string;
-  /** The provider ID this backup is for (e.g., "google-gemini-cli") */
-  providerId: string;
-  /** The OAuth credentials */
-  credentials: OAuthCredentials;
-  /** When this backup was created */
-  createdAt: string;
-}
-
-interface HaOAuthStorage {
-  backups: BackupOAuthEntry[];
-}
-
-interface OAuthCredentials {
-  type: "oauth";
-  refresh: string;
-  access: string;
-  expires: number;
-  projectId?: string;
-  email?: string;
+  /** Base provider to mirror models from (e.g., "google-gemini-cli") */
+  mirrors: string;
+  /** API type */
+  api: string;
+  /** Base URL for API endpoint */
+  baseUrl: string;
+  /** OAuth configuration */
+  oauth: {
+    /** Authorization URL */
+    authorizeUrl: string;
+    /** Token URL */
+    tokenUrl: string;
+    /** Client ID (can be base64 encoded) */
+    clientId: string;
+    /** Redirect URI */
+    redirectUri: string;
+    /** OAuth scopes */
+    scopes: string;
+    /** Whether clientId is base64 encoded */
+    clientIdEncoded?: boolean;
+  };
 }
 
 interface ExhaustedEntry {
@@ -74,21 +86,17 @@ interface HaState {
   exhausted: Map<string, ExhaustedEntry>;
   lastRetryMessage: string | null;
   isRetrying: boolean;
-  /** Track which backup we're currently using per provider */
-  activeBackup: Map<string, string>; // providerId -> backupName
 }
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-const AGENT_DIR = join(homedir(), ".pi", "agent");
-const CONFIG_PATH = join(AGENT_DIR, "ha.json");
-const OAUTH_STORAGE_PATH = join(AGENT_DIR, "ha-oauth.json");
-const AUTH_PATH = join(AGENT_DIR, "auth.json");
+const CONFIG_PATH = join(homedir(), ".pi", "ha.json");
 const DEFAULT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
 // Quota error patterns to detect
+// Quota error patterns - trigger immediately
 const QUOTA_ERROR_PATTERNS = [
   /429/i,
   /quota exceeded/i,
@@ -100,7 +108,7 @@ const QUOTA_ERROR_PATTERNS = [
   /billing.*exhausted/i,
 ];
 
-// Capacity error patterns
+// Capacity error patterns - trigger immediately for most providers
 const CAPACITY_ERROR_PATTERNS = [
   /capacity constraints/i,
   /engine overloaded/i,
@@ -121,13 +129,12 @@ const state: HaState = {
   exhausted: new Map(),
   lastRetryMessage: null,
   isRetrying: false,
-  activeBackup: new Map(),
 };
 
 let config: HaConfig | null = null;
 
 // =============================================================================
-// Configuration Loaders
+// Configuration Loader
 // =============================================================================
 
 function loadConfig(): HaConfig | null {
@@ -152,78 +159,50 @@ function saveConfig(cfg: HaConfig): void {
   }
 }
 
-function loadOAuthStorage(): HaOAuthStorage {
-  if (!existsSync(OAUTH_STORAGE_PATH)) {
-    return { backups: [] };
-  }
-
-  try {
-    const content = readFileSync(OAUTH_STORAGE_PATH, "utf-8");
-    return JSON.parse(content) as HaOAuthStorage;
-  } catch (err) {
-    console.error("[HA] Failed to load ha-oauth.json:", err);
-    return { backups: [] };
-  }
-}
-
-function saveOAuthStorage(storage: HaOAuthStorage): void {
-  try {
-    writeFileSync(OAUTH_STORAGE_PATH, JSON.stringify(storage, null, 2), "utf-8");
-  } catch (err) {
-    console.error("[HA] Failed to save ha-oauth.json:", err);
-  }
-}
-
-function loadAuthJson(): Record<string, any> {
-  if (!existsSync(AUTH_PATH)) {
-    return {};
-  }
-  try {
-    const content = readFileSync(AUTH_PATH, "utf-8");
-    return JSON.parse(content);
-  } catch (err) {
-    console.error("[HA] Failed to load auth.json:", err);
-    return {};
-  }
-}
-
-function saveAuthJson(auth: Record<string, any>): void {
-  try {
-    writeFileSync(AUTH_PATH, JSON.stringify(auth, null, 2), "utf-8");
-  } catch (err) {
-    console.error("[HA] Failed to save auth.json:", err);
-  }
-}
-
 // =============================================================================
 // Utility Functions
 // =============================================================================
 
+/**
+ * Check if error is a quota/rate limit error (trigger immediately)
+ */
 function isQuotaError(errorMessage: string | undefined): boolean {
   if (!errorMessage) return false;
   const lowerMsg = errorMessage.toLowerCase();
   return QUOTA_ERROR_PATTERNS.some((pattern) => pattern.test(lowerMsg));
 }
 
+/**
+ * Check if error is a capacity error.
+ * For Google Gemini: only trigger on final "Retry failed" message.
+ * For other providers: trigger on immediate capacity errors.
+ */
 function isCapacityError(errorMessage: string | undefined, provider?: string): boolean {
   if (!errorMessage) return false;
   const lowerMsg = errorMessage.toLowerCase();
 
   // Google Gemini specific: only trigger on "Retry failed after N attempts"
+  // This indicates the internal retries have exhausted
   if (provider?.includes("google") || provider?.includes("gemini")) {
+    // Check if it's the final retry failure
     if (GEMINI_FINAL_RETRY_PATTERN.test(lowerMsg)) {
       console.log("[HA] Detected Gemini final retry failure");
       return true;
     }
+    // Don't trigger on intermediate "No capacity" messages
     if (/no capacity available/.test(lowerMsg)) {
       console.log("[HA] Ignoring intermediate Gemini capacity error (waiting for final retry)");
       return false;
     }
   }
 
+  // For other providers, trigger on immediate capacity errors
   return CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(lowerMsg));
 }
 
+/**
+ * Check if error should trigger failover
+ */
 function shouldTriggerFailover(errorMessage: string | undefined, provider?: string): boolean {
   return isQuotaError(errorMessage) || isCapacityError(errorMessage, provider);
 }
@@ -231,13 +210,14 @@ function shouldTriggerFailover(errorMessage: string | undefined, provider?: stri
 function isExhausted(entryId: string): boolean {
   const entry = state.exhausted.get(entryId);
   if (!entry) return false;
-
+  
   const now = Date.now();
   if (now - entry.exhaustedAt >= entry.cooldownMs) {
+    // Cooldown expired, remove from exhausted list
     state.exhausted.delete(entryId);
     return false;
   }
-
+  
   return true;
 }
 
@@ -262,173 +242,161 @@ function parseEntryId(entryId: string): { provider: string; modelId?: string } {
 }
 
 // =============================================================================
-// OAuth Backup Management
+// PKCE Utilities for OAuth
 // =============================================================================
 
-/**
- * Save current OAuth credentials as a backup, then clear them for re-authentication
- */
-async function prepareForBackupAuth(
-  ctx: any,
-  providerId: string,
-  backupName: string
-): Promise<boolean> {
-  const auth = loadAuthJson();
+async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
+  const array = new Uint8Array(32);
+  crypto.getRandomValues(array);
+  const verifier = btoa(String.fromCharCode(...array))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 
-  if (!auth[providerId] || auth[providerId].type !== "oauth") {
-    ctx.ui.notify(`No OAuth credentials found for ${providerId}. Use /login first.`, "error");
-    return false;
-  }
+  const encoder = new TextEncoder();
+  const data = encoder.encode(verifier);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  const challenge = btoa(String.fromCharCode(...new Uint8Array(hash)))
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
 
-  // Save current credentials as backup
-  const storage = loadOAuthStorage();
-
-  // Check if backup name already exists
-  const existingIndex = storage.backups.findIndex(
-    (b) => b.providerId === providerId && b.name === backupName
-  );
-
-  const backupEntry: BackupOAuthEntry = {
-    name: backupName,
-    providerId,
-    credentials: auth[providerId],
-    createdAt: new Date().toISOString(),
-  };
-
-  if (existingIndex >= 0) {
-    storage.backups[existingIndex] = backupEntry;
-    ctx.ui.notify(`Updated existing backup "${backupName}" for ${providerId}`, "info");
-  } else {
-    storage.backups.push(backupEntry);
-    ctx.ui.notify(`Saved backup "${backupName}" for ${providerId}`, "info");
-  }
-
-  saveOAuthStorage(storage);
-
-  // Remove from auth.json so user can re-authenticate
-  delete auth[providerId];
-  saveAuthJson(auth);
-
-  ctx.ui.notify(
-    `Cleared ${providerId} from auth.json.\nNow run /login to authenticate with your backup account.`,
-    "info"
-  );
-
-  return true;
+  return { verifier, challenge };
 }
 
-/**
- * Capture newly authenticated credentials as a backup
- */
-async function captureBackupAuth(
-  ctx: any,
-  providerId: string,
-  backupName: string
-): Promise<boolean> {
-  const auth = loadAuthJson();
+// =============================================================================
+// Custom Provider Registration
+// =============================================================================
 
-  if (!auth[providerId] || auth[providerId].type !== "oauth") {
-    ctx.ui.notify(
-      `No OAuth credentials found for ${providerId}.\nMake sure you completed the /login flow.`,
-      "error"
+function registerCustomProviders(pi: ExtensionAPI, cfg: HaConfig): void {
+  if (!cfg.customProviders) return;
+
+  const availableModels = pi.getAvailableModels?.() || [];
+
+  for (const customProvider of cfg.customProviders) {
+    // Find models to mirror from the base provider
+    const modelsToMirror = availableModels.filter(
+      (m) => m.provider === customProvider.mirrors
     );
-    return false;
-  }
 
-  // Save as backup
-  const storage = loadOAuthStorage();
-
-  const existingIndex = storage.backups.findIndex(
-    (b) => b.providerId === providerId && b.name === backupName
-  );
-
-  const backupEntry: BackupOAuthEntry = {
-    name: backupName,
-    providerId,
-    credentials: auth[providerId],
-    createdAt: new Date().toISOString(),
-  };
-
-  if (existingIndex >= 0) {
-    storage.backups[existingIndex] = backupEntry;
-  } else {
-    storage.backups.push(backupEntry);
-  }
-
-  saveOAuthStorage(storage);
-
-  ctx.ui.notify(`Captured backup "${backupName}" for ${providerId}`, "info");
-
-  // Restore primary credentials if we have them
-  const primaryBackup = storage.backups.find(
-    (b) => b.providerId === providerId && b.name === "primary"
-  );
-
-  if (primaryBackup) {
-    auth[providerId] = primaryBackup.credentials;
-    saveAuthJson(auth);
-    ctx.ui.notify(`Restored primary credentials for ${providerId}`, "info");
-  } else {
-    ctx.ui.notify(
-      `No primary credentials found. You're now using the backup account as primary.`,
-      "warning"
-    );
-  }
-
-  return true;
-}
-
-/**
- * Switch to a backup OAuth account
- */
-async function switchToBackup(
-  ctx: any,
-  providerId: string,
-  backupName: string
-): Promise<boolean> {
-  const storage = loadOAuthStorage();
-  const backup = storage.backups.find(
-    (b) => b.providerId === providerId && b.name === backupName
-  );
-
-  if (!backup) {
-    ctx.ui.notify(`Backup "${backupName}" not found for ${providerId}`, "error");
-    return false;
-  }
-
-  // Save current as "primary" if we haven't already
-  const auth = loadAuthJson();
-  if (auth[providerId]?.type === "oauth") {
-    const existingPrimary = storage.backups.find(
-      (b) => b.providerId === providerId && b.name === "primary"
-    );
-    if (!existingPrimary) {
-      storage.backups.push({
-        name: "primary",
-        providerId,
-        credentials: auth[providerId],
-        createdAt: new Date().toISOString(),
-      });
-      saveOAuthStorage(storage);
+    if (modelsToMirror.length === 0) {
+      console.warn(
+        `[HA] No models found to mirror from ${customProvider.mirrors} for ${customProvider.id}`
+      );
+      continue;
     }
+
+    // Mirror models with new provider name
+    const mirroredModels = modelsToMirror.map((model) => ({
+      id: model.id,
+      name: `${model.name} (${customProvider.name})`,
+      api: customProvider.api as Api,
+      reasoning: model.reasoning ?? false,
+      input: model.input ?? (["text"] as ("text" | "image")[]),
+      cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: model.contextWindow ?? 128000,
+      maxTokens: model.maxTokens ?? 4096,
+    }));
+
+    // Decode client ID if needed
+    const clientId = customProvider.oauth.clientIdEncoded
+      ? atob(customProvider.oauth.clientId)
+      : customProvider.oauth.clientId;
+
+    // Register the custom provider with OAuth
+    pi.registerProvider(customProvider.id, {
+      baseUrl: customProvider.baseUrl,
+      api: customProvider.api as Api,
+      models: mirroredModels,
+      oauth: {
+        name: customProvider.name,
+        login: async (callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> => {
+          const { verifier, challenge } = await generatePKCE();
+
+          const authParams = new URLSearchParams({
+            code: "true",
+            client_id: clientId,
+            response_type: "code",
+            redirect_uri: customProvider.oauth.redirectUri,
+            scope: customProvider.oauth.scopes,
+            code_challenge: challenge,
+            code_challenge_method: "S256",
+            state: verifier,
+          });
+
+          callbacks.onAuth({
+            url: `${customProvider.oauth.authorizeUrl}?${authParams.toString()}`,
+          });
+
+          const authCode = await callbacks.onPrompt({
+            message: "Paste the authorization code:",
+          });
+          const [code, stateValue] = authCode.split("#");
+
+          const tokenResponse = await fetch(customProvider.oauth.tokenUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              grant_type: "authorization_code",
+              client_id: clientId,
+              code,
+              state: stateValue,
+              redirect_uri: customProvider.oauth.redirectUri,
+              code_verifier: verifier,
+            }),
+          });
+
+          if (!tokenResponse.ok) {
+            throw new Error(`Token exchange failed: ${await tokenResponse.text()}`);
+          }
+
+          const data = (await tokenResponse.json()) as {
+            access_token: string;
+            refresh_token: string;
+            expires_in: number;
+          };
+
+          return {
+            refresh: data.refresh_token,
+            access: data.access_token,
+            expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
+          };
+        },
+        refreshToken: async (credentials: OAuthCredentials): Promise<OAuthCredentials> => {
+          const response = await fetch(customProvider.oauth.tokenUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              grant_type: "refresh_token",
+              client_id: clientId,
+              refresh_token: credentials.refresh,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error(`Token refresh failed: ${await response.text()}`);
+          }
+
+          const data = (await response.json()) as {
+            access_token: string;
+            refresh_token: string;
+            expires_in: number;
+          };
+
+          return {
+            refresh: data.refresh_token,
+            access: data.access_token,
+            expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
+          };
+        },
+        getApiKey: (cred: OAuthCredentials) => cred.access,
+      },
+    });
+
+    console.log(
+      `[HA] Registered custom provider: ${customProvider.id} with ${mirroredModels.length} models`
+    );
   }
-
-  // Switch to backup
-  auth[providerId] = backup.credentials;
-  saveAuthJson(auth);
-
-  state.activeBackup.set(providerId, backupName);
-
-  ctx.ui.notify(`Switched ${providerId} to backup account "${backupName}"`, "info");
-  return true;
-}
-
-/**
- * List all backups for a provider
- */
-function listBackups(providerId: string): BackupOAuthEntry[] {
-  const storage = loadOAuthStorage();
-  return storage.backups.filter((b) => b.providerId === providerId);
 }
 
 // =============================================================================
@@ -439,7 +407,7 @@ async function findNextAvailableProvider(
   pi: ExtensionAPI,
   ctx: any,
   currentModel: Model<any> | undefined
-): Promise<{ model: Model<any>; entry: HaGroupEntry; useBackup?: string } | null> {
+): Promise<{ model: Model<any>; entry: HaGroupEntry } | null> {
   if (!config || !state.activeGroup) return null;
 
   const group = config.groups[state.activeGroup];
@@ -456,11 +424,7 @@ async function findNextAvailableProvider(
       continue;
     }
 
-    // Check if we have a backup for this provider
-    const backups = listBackups(provider);
-    const activeBackup = state.activeBackup.get(provider);
-
-    // Try to find an available model
+    // Get available models for this provider
     const availableModels = ctx.modelRegistry.getAvailable().filter(
       (m: Model<any>) => m.provider === provider
     );
@@ -479,6 +443,7 @@ async function findNextAvailableProvider(
         continue;
       }
     } else {
+      // Pick the first available model (or try to match capability tier)
       selectedModel = availableModels[0];
     }
 
@@ -486,20 +451,6 @@ async function findNextAvailableProvider(
     const apiKey = await ctx.modelRegistry.getApiKey(selectedModel);
     if (!apiKey) {
       console.log(`[HA] No API key available for ${selectedModel.provider}/${selectedModel.id}`);
-
-      // Try to switch to a backup if available
-      const unusedBackup = backups.find((b) => b.name !== activeBackup && b.name !== "primary");
-      if (unusedBackup) {
-        console.log(`[HA] Trying backup ${unusedBackup.name} for ${provider}`);
-        const switched = await switchToBackup(ctx, provider, unusedBackup.name);
-        if (switched) {
-          // Retry getting API key
-          const backupApiKey = await ctx.modelRegistry.getApiKey(selectedModel);
-          if (backupApiKey) {
-            return { model: selectedModel, entry, useBackup: unusedBackup.name };
-          }
-        }
-      }
       continue;
     }
 
@@ -514,11 +465,19 @@ async function findNextAvailableProvider(
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
+  // Load configuration
   config = loadConfig();
 
   if (!config) {
     console.log("[HA] No ha.json found. Run /ha-init to create one.");
-  } else if (config.defaultGroup && config.groups[config.defaultGroup]) {
+    return;
+  }
+
+  // Register custom providers for backup OAuth accounts
+  registerCustomProviders(pi, config);
+
+  // Set initial active group
+  if (config.defaultGroup && config.groups[config.defaultGroup]) {
     state.activeGroup = config.defaultGroup;
     console.log(`[HA] Active group: ${state.activeGroup}`);
   }
@@ -532,7 +491,7 @@ export default function (pi: ExtensionAPI) {
     description: "Initialize HA configuration file",
     handler: async (_args, ctx) => {
       if (existsSync(CONFIG_PATH)) {
-        ctx.ui.notify("HA configuration already exists at ~/.pi/agent/ha.json", "warning");
+        ctx.ui.notify("HA configuration already exists at ~/.pi/ha.json", "warning");
         return;
       }
 
@@ -551,7 +510,7 @@ export default function (pi: ExtensionAPI) {
       };
 
       saveConfig(defaultConfig);
-      ctx.ui.notify("Created ~/.pi/agent/ha.json. Edit it to configure your failover groups.", "info");
+      ctx.ui.notify("Created ~/.pi/ha.json. Edit it to configure your failover groups.", "info");
     },
   });
 
@@ -571,7 +530,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       state.activeGroup = groupName;
-      state.exhausted.clear();
+      state.exhausted.clear(); // Clear exhausted state when switching groups
       ctx.ui.notify(`Switched to HA group: ${groupName}`, "info");
     },
   });
@@ -594,28 +553,8 @@ export default function (pi: ExtensionAPI) {
         lines.push(`Group '${state.activeGroup}' entries:`);
         for (const entry of group.entries) {
           const exhausted = isExhausted(entry.id);
-          const { provider } = parseEntryId(entry.id);
-          const activeBackup = state.activeBackup.get(provider);
-          const backupInfo = activeBackup ? ` (backup: ${activeBackup})` : "";
           const status = exhausted ? "❌ exhausted" : "✅ available";
-          lines.push(`  ${entry.id}${backupInfo} - ${status}`);
-        }
-      }
-
-      // Show OAuth backups
-      const storage = loadOAuthStorage();
-      if (storage.backups.length > 0) {
-        lines.push("");
-        lines.push("OAuth backups:");
-        const providers = new Set(storage.backups.map((b) => b.providerId));
-        for (const providerId of providers) {
-          const backups = storage.backups.filter((b) => b.providerId === providerId);
-          lines.push(`  ${providerId}:`);
-          for (const backup of backups) {
-            const isActive = state.activeBackup.get(providerId) === backup.name;
-            const marker = isActive ? "→ " : "  ";
-            lines.push(`    ${marker}${backup.name} (${new Date(backup.createdAt).toLocaleDateString()})`);
-          }
+          lines.push(`  ${entry.id} - ${status}`);
         }
       }
 
@@ -633,109 +572,26 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Create OAuth backup - Step 1: Save current and clear
-  pi.registerCommand("ha-backup-create", {
-    description: "Create a backup OAuth account (Step 1: Save current credentials)",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(" ");
-      if (parts.length < 2) {
-        ctx.ui.notify("Usage: /ha-backup-create <provider-id> <backup-name>", "error");
-        ctx.ui.notify("Example: /ha-backup-create google-gemini-cli backup-1", "info");
-        return;
-      }
-
-      const [providerId, backupName] = parts;
-
-      if (backupName === "primary") {
-        ctx.ui.notify("'primary' is a reserved backup name. Use a different name.", "error");
-        return;
-      }
-
-      const success = await prepareForBackupAuth(ctx, providerId, backupName);
-      if (success) {
-        ctx.ui.notify(
-          `\nNext steps:\n` +
-          `1. Run /login to authenticate with your backup account\n` +
-          `2. Run: /ha-backup-capture ${providerId} ${backupName}`,
-          "info"
-        );
-      }
-    },
-  });
-
-  // Create OAuth backup - Step 2: Capture new credentials
-  pi.registerCommand("ha-backup-capture", {
-    description: "Create a backup OAuth account (Step 2: Capture new credentials)",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(" ");
-      if (parts.length < 2) {
-        ctx.ui.notify("Usage: /ha-backup-capture <provider-id> <backup-name>", "error");
-        return;
-      }
-
-      const [providerId, backupName] = parts;
-      await captureBackupAuth(ctx, providerId, backupName);
-    },
-  });
-
-  // Switch to a backup OAuth account
-  pi.registerCommand("ha-backup-switch", {
-    description: "Switch to a backup OAuth account",
-    handler: async (args, ctx) => {
-      const parts = args.trim().split(" ");
-      if (parts.length < 2) {
-        ctx.ui.notify("Usage: /ha-backup-switch <provider-id> <backup-name>", "error");
-        ctx.ui.notify("Example: /ha-backup-switch google-gemini-cli backup-1", "info");
-        return;
-      }
-
-      const [providerId, backupName] = parts;
-      await switchToBackup(ctx, providerId, backupName);
-    },
-  });
-
-  // List OAuth backups for a provider
-  pi.registerCommand("ha-backup-list", {
-    description: "List OAuth backups for a provider",
-    handler: async (args, ctx) => {
-      const providerId = args.trim();
-      if (!providerId) {
-        ctx.ui.notify("Usage: /ha-backup-list <provider-id>", "error");
-        return;
-      }
-
-      const backups = listBackups(providerId);
-      if (backups.length === 0) {
-        ctx.ui.notify(`No backups found for ${providerId}`, "info");
-        return;
-      }
-
-      const lines: string[] = [];
-      lines.push(`Backups for ${providerId}:`);
-      for (const backup of backups) {
-        const isActive = state.activeBackup.get(providerId) === backup.name;
-        const marker = isActive ? "→ " : "  ";
-        lines.push(`${marker}${backup.name} (${new Date(backup.createdAt).toLocaleDateString()})`);
-      }
-
-      ctx.ui.notify(lines.join("\n"), "info");
-    },
-  });
-
   // =============================================================================
   // Failover Hook
   // =============================================================================
 
   pi.on("turn_end", async (event, ctx) => {
+    // Skip if no config or no active group
     if (!config || !state.activeGroup) return;
+
+    // Skip if we're already in a retry (prevent loops)
     if (state.isRetrying) return;
 
+    // Check if this turn resulted in a quota error
     const message = event.message;
     if (!message || message.role !== "assistant") return;
 
+    // Check for error stop reason or error message
     const hasError = message.stopReason === "error" || message.errorMessage;
     if (!hasError) return;
 
+    // Check if it's a quota or capacity error
     const currentModel = ctx.model;
     const currentProvider = currentModel?.provider;
 
@@ -754,51 +610,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[HA] Marked ${currentEntryId} as exhausted`);
     }
 
-    // Try to switch to a backup first if available
-    if (currentProvider) {
-      const backups = listBackups(currentProvider);
-      const activeBackup = state.activeBackup.get(currentProvider);
-      const unusedBackup = backups.find(
-        (b) => b.name !== activeBackup && b.name !== "primary"
-      );
-
-      if (unusedBackup) {
-        console.log(`[HA] Trying backup ${unusedBackup.name} for ${currentProvider}`);
-        const switched = await switchToBackup(ctx, currentProvider, unusedBackup.name);
-        if (switched) {
-          ctx.ui.notify(
-            `⚠️ ${isCapacityError(message.errorMessage, currentProvider) ? "Capacity" : "Quota"} hit on ${currentProvider}!\n` +
-            `Switched to backup account "${unusedBackup.name}". Retrying...`,
-            "warning"
-          );
-
-          // Retry the message
-          const branch = ctx.sessionManager.getBranch();
-          const lastUserMessage = branch
-            .slice()
-            .reverse()
-            .find((entry: any) => entry.type === "message" && entry.message?.role === "user");
-
-          if (lastUserMessage) {
-            state.isRetrying = true;
-            state.lastRetryMessage =
-              typeof lastUserMessage.message.content === "string"
-                ? lastUserMessage.message.content
-                : JSON.stringify(lastUserMessage.message.content);
-
-            await new Promise((resolve) => setTimeout(resolve, 500));
-            pi.sendUserMessage(lastUserMessage.message.content, { deliverAs: "steer" });
-
-            setTimeout(() => {
-              state.isRetrying = false;
-            }, 5000);
-          }
-          return;
-        }
-      }
-    }
-
-    // Find next available provider in group
+    // Find next available provider
     const next = await findNextAvailableProvider(pi, ctx, currentModel);
     if (!next) {
       ctx.ui.notify("⚠️ All providers in group exhausted. No failover available.", "error");
@@ -810,10 +622,9 @@ export default function (pi: ExtensionAPI) {
       ? `${currentModel.provider}/${currentModel.id}`
       : "current";
     const toProvider = `${next.model.provider}/${next.model.id}`;
-    const errorType = isCapacityError(message.errorMessage, currentProvider)
-      ? "Capacity exhausted"
+    const errorType = isCapacityError(message.errorMessage, currentProvider) 
+      ? "Capacity exhausted" 
       : "Quota hit";
-
     ctx.ui.notify(
       `⚠️ ${errorType} on ${fromProvider}!\nSwitching to ${toProvider}...`,
       "warning"
@@ -876,6 +687,7 @@ export default function (pi: ExtensionAPI) {
 
   // Reset retry flag on successful message (non-error turn)
   pi.on("turn_start", async (_event, _ctx) => {
+    // Clear retry state when a new turn starts successfully
     if (state.lastRetryMessage && !state.isRetrying) {
       state.lastRetryMessage = null;
     }
