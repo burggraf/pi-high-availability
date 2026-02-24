@@ -9,7 +9,8 @@
 - **Multiple OAuth Accounts**: Automatically stores multiple OAuth credentials for the same provider
 - **Smart Error Detection**: Distinguishes between quota errors, rate limits, and capacity constraints
 - **Google Gemini Aware**: Waits for Gemini's internal retries to complete before failing over
-- **Cooldown Management**: Temporarily skips exhausted providers (default: 1 hour, configurable)
+- **Smart Cooldown Management**: Tracks exhaustion per individual credential (e.g., primary vs backup) and per provider, with a configurable 1-hour default.
+- **Failover Chain**: Automatically tries all available credentials for the current provider before switching to the next provider in your priority group.
 - **Automatic Retry**: Resends your last message after switching providers
 - **Loop Prevention**: Ensures each provider is only tried once per message
 

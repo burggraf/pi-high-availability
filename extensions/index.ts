@@ -1,8 +1,8 @@
 /**
  * High Availability Provider Extension for Pi
- * 
+ *
  * Automatically switches to fallback providers when quota is exhausted.
- * Supports multiple OAuth accounts per provider.
+ * Supports multiple credentials (OAuth and API keys) per provider.
  */
 
 import type { Model } from "@mariozechner/pi-ai";
@@ -30,10 +30,11 @@ interface HaConfig {
   defaultGroup?: string;
   defaultCooldownMs?: number;
   /**
-   * OAuth storage - keyed by provider ID, contains multiple named credentials
+   * Credential storage - keyed by provider ID, contains multiple named credentials
    * e.g., "google-gemini-cli": { "primary": {...}, "backup-1": {...} }
+   * Supports both OAuth and API key types
    */
-  oauth?: Record<string, Record<string, any>>;
+  credentials?: Record<string, Record<string, any>>;
 }
 
 interface ExhaustedEntry {
@@ -51,7 +52,7 @@ interface HaState {
    * Track which OAuth credential is active for each provider
    * e.g., "google-gemini-cli" -> "primary"
    */
-  activeOAuth: Map<string, string>;
+  activeCredential: Map<string, string>;
 }
 
 // =============================================================================
@@ -93,7 +94,7 @@ const state: HaState = {
   exhausted: new Map(),
   lastRetryMessage: null,
   isRetrying: false,
-  activeOAuth: new Map(),
+  activeCredential: new Map(),
 };
 
 let config: HaConfig | null = null;
@@ -150,28 +151,27 @@ function saveAuthJson(auth: Record<string, any>): void {
 // =============================================================================
 
 /**
- * Sync OAuth entries from auth.json to ha.json
- * Preserves existing entries in ha.json, adds new ones with unique names
+ * Sync all credentials from auth.json to ha.json
+ * Preserves existing entries, adds new ones with unique names
+ * Handles both OAuth and API key entries
  */
-function syncOAuthToHa(): void {
+function syncAuthToHa(): void {
   if (!config) return;
 
   const auth = loadAuthJson();
-  if (!config.oauth) {
-    config.oauth = {};
+  if (!config.credentials) {
+    config.credentials = {};
   }
 
   let changed = false;
 
   for (const [providerId, credentials] of Object.entries(auth)) {
-    if (credentials.type !== "oauth") continue;
-
     // Initialize provider entry if needed
-    if (!config.oauth[providerId]) {
-      config.oauth[providerId] = {};
+    if (!config.credentials[providerId]) {
+      config.credentials[providerId] = {};
     }
 
-    const existingEntries = config.oauth[providerId];
+    const existingEntries = config.credentials[providerId];
     
     // Check if this exact credential already exists
     let found = false;
@@ -195,7 +195,7 @@ function syncOAuthToHa(): void {
       
       existingEntries[name] = credentials;
       changed = true;
-      console.log(`[HA] Synced OAuth for ${providerId} as "${name}"`);
+      console.log(`[HA] Synced ${credentials.type} for ${providerId} as "${name}"`);
     }
   }
 
@@ -226,42 +226,49 @@ function credentialsMatch(a: any, b: any): boolean {
  * Switch to a specific OAuth credential for a provider
  */
 function switchOAuthCredential(providerId: string, credentialName: string): boolean {
-  if (!config?.oauth?.[providerId]?.[credentialName]) {
+  if (!config?.credentials?.[providerId]?.[credentialName]) {
     return false;
   }
 
   const auth = loadAuthJson();
-  auth[providerId] = config.oauth[providerId][credentialName];
+  auth[providerId] = config.credentials[providerId][credentialName];
   saveAuthJson(auth);
   
-  state.activeOAuth.set(providerId, credentialName);
+  state.activeCredential.set(providerId, credentialName);
   return true;
 }
 
 /**
- * Get next available OAuth credential for a provider
+ * Get next available credential for a provider that isn't exhausted
  */
-function getNextOAuthCredential(providerId: string): string | null {
-  if (!config?.oauth?.[providerId]) return null;
+function getNextCredential(providerId: string): string | null {
+  if (!config?.credentials?.[providerId]) return null;
 
-  const entries = config.oauth[providerId];
-  const current = state.activeOAuth.get(providerId) || "primary";
+  const entries = config.credentials[providerId];
+  const current = state.activeCredential.get(providerId) || "primary";
   
-  // Get all credential names
   const names = Object.keys(entries);
   if (names.length <= 1) return null;
 
-  // Find current index and return next
   const currentIndex = names.indexOf(current);
-  if (currentIndex === -1) return names[0];
-  
-  const nextIndex = (currentIndex + 1) % names.length;
-  return names[nextIndex];
-}
+  const startIndex = currentIndex === -1 ? 0 : (currentIndex + 1) % names.length;
 
-// =============================================================================
-// Utility Functions
-// =============================================================================
+  // Look for the first non-exhausted credential starting from the next one
+  for (let i = 0; i < names.length; i++) {
+    const index = (startIndex + i) % names.length;
+    const name = names[index];
+    
+    // Don't return the one we're already on
+    if (name === current) continue;
+    
+    // Check if this specific credential is exhausted
+    if (!isExhausted(`${providerId}:${name}`)) {
+      return name;
+    }
+  }
+
+  return null;
+}
 
 function isQuotaError(errorMessage: string | undefined): boolean {
   if (!errorMessage) return false;
@@ -319,10 +326,6 @@ function parseEntryId(entryId: string): { provider: string; modelId?: string } {
   }
   return { provider: entryId };
 }
-
-// =============================================================================
-// Failover Logic
-// =============================================================================
 
 async function findNextAvailableProvider(
   pi: ExtensionAPI,
@@ -389,7 +392,7 @@ export default function (pi: ExtensionAPI) {
       console.log(`[HA] Active group: ${state.activeGroup}`);
     }
     // Sync OAuth on startup
-    syncOAuthToHa();
+    syncAuthToHa();
   } else {
     console.log("[HA] No ha.json found. Run /ha-init to create one.");
   }
@@ -406,23 +409,44 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Build entries from actual providers in auth.json
+      const auth = loadAuthJson();
+      const entries: HaGroupEntry[] = [];
+      
+      for (const providerId of Object.keys(auth)) {
+        entries.push({ id: providerId });
+      }
+
+      // If no providers, add some defaults
+      if (entries.length === 0) {
+        entries.push(
+          { id: "anthropic" },
+          { id: "google-gemini-cli" },
+          { id: "openai" }
+        );
+      }
+
       const defaultConfig: HaConfig = {
         groups: {
           default: {
             name: "Default",
-            entries: [
-              { id: "anthropic/claude-3-5-sonnet" },
-              { id: "google-gemini-cli/gemini-1.5-pro" },
-            ],
+            entries,
           },
         },
         defaultGroup: "default",
         defaultCooldownMs: DEFAULT_COOLDOWN_MS,
-        oauth: {},
+        credentials: {},
       };
 
       saveConfig(defaultConfig);
-      ctx.ui.notify("Created ~/.pi/agent/ha.json. Edit it to configure your failover groups.", "info");
+      
+      // Reload config so it's immediately available
+      config = loadConfig();
+      if (config?.defaultGroup) {
+        state.activeGroup = config.defaultGroup;
+      }
+      
+      ctx.ui.notify(`Created ~/.pi/agent/ha.json with ${entries.length} provider(s). Run /ha-sync to sync credentials.`, "info");
     },
   });
 
@@ -464,20 +488,20 @@ export default function (pi: ExtensionAPI) {
         for (const entry of group.entries) {
           const exhausted = isExhausted(entry.id);
           const { provider } = parseEntryId(entry.id);
-          const activeOAuth = state.activeOAuth.get(provider);
-          const oauthInfo = activeOAuth ? ` [${activeOAuth}]` : "";
+          const activeCredential = state.activeCredential.get(provider);
+          const oauthInfo = activeCredential ? ` [${activeCredential}]` : "";
           const status = exhausted ? "❌ exhausted" : "✅ available";
           lines.push(`  ${entry.id}${oauthInfo} - ${status}`);
         }
       }
 
       // Show OAuth credentials
-      if (config.oauth && Object.keys(config.oauth).length > 0) {
+      if (config.credentials && Object.keys(config.credentials).length > 0) {
         lines.push("");
-        lines.push("OAuth credentials stored:");
-        for (const [providerId, entries] of Object.entries(config.oauth)) {
+        lines.push("Credentials stored:");
+        for (const [providerId, entries] of Object.entries(config.credentials)) {
           const names = Object.keys(entries);
-          const active = state.activeOAuth.get(providerId) || "primary";
+          const active = state.activeCredential.get(providerId) || "primary";
           lines.push(`  ${providerId}: ${names.join(", ")} (active: ${active})`);
         }
       }
@@ -497,20 +521,20 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("ha-sync", {
-    description: "Sync OAuth credentials from auth.json to ha.json",
+    description: "Sync all credentials from auth.json to ha.json",
     handler: async (_args, ctx) => {
       if (!config) {
         ctx.ui.notify("HA not configured. Run /ha-init first.", "warning");
         return;
       }
 
-      syncOAuthToHa();
-      ctx.ui.notify("Synced OAuth credentials from auth.json to ha.json", "info");
+      syncAuthToHa();
+      ctx.ui.notify("Synced credentials from auth.json to ha.json", "info");
     },
   });
 
   pi.registerCommand("ha-switch", {
-    description: "Switch to a different OAuth credential for a provider",
+    description: "Switch to a different credential for a provider",
     handler: async (args, ctx) => {
       const parts = args.trim().split(" ");
       if (parts.length < 2) {
@@ -554,16 +578,22 @@ export default function (pi: ExtensionAPI) {
 
     console.log(`[HA] Failover error detected: ${message.errorMessage}`);
 
-    // Try switching to next OAuth credential first
+    // Try switching to next credential for the current provider first
     if (currentProvider) {
-      const nextCredential = getNextOAuthCredential(currentProvider);
+      const currentCredName = state.activeCredential.get(currentProvider) || "primary";
+      const globalDefaultCooldown = config.defaultCooldownMs ?? DEFAULT_COOLDOWN_MS;
+      
+      // Mark the current credential as exhausted
+      markExhausted(`${currentProvider}:${currentCredName}`, globalDefaultCooldown);
+
+      const nextCredential = getNextCredential(currentProvider);
       if (nextCredential) {
-        console.log(`[HA] Trying OAuth credential "${nextCredential}" for ${currentProvider}`);
+        console.log(`[HA] Trying next credential "${nextCredential}" for ${currentProvider}`);
         const switched = switchOAuthCredential(currentProvider, nextCredential);
         if (switched) {
           ctx.ui.notify(
             `⚠️ ${isCapacityError(message.errorMessage, currentProvider) ? "Capacity" : "Quota"} hit!\n` +
-            `Switched ${currentProvider} to "${nextCredential}". Retrying...`,
+            `Switched ${currentProvider} to account "${nextCredential}". Retrying...`,
             "warning"
           );
 
