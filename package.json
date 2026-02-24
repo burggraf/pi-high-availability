@@ -1,0 +1,37 @@
+{
+  "name": "pi-high-availability",
+  "version": "1.0.0",
+  "description": "High Availability extension for pi - automatic failover when quota or capacity is exhausted",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/burggraf/pi-high-availability.git"
+  },
+  "author": "Mark Burggraf",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "high-availability",
+    "failover",
+    "quota",
+    "capacity"
+  ],
+  "main": "extensions/index.ts",
+  "files": [
+    "extensions",
+    "package.json",
+    "README.md"
+  ],
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "pi": {
+    "extensions": [
+      "extensions/index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  }
+}
