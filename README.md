@@ -6,7 +6,7 @@
 
 - **Automatic Failover**: Detects quota exhaustion (429 errors) and capacity constraints, then seamlessly switches to backup providers
 - **User-Defined Priority Groups**: Create custom failover chains (e.g., "Pro" → "Fast" → "Cheap")
-- **Multiple OAuth Accounts**: Register backup OAuth credentials for the same provider (e.g., two Google accounts)
+- **Multiple OAuth Accounts**: Automatically stores multiple OAuth credentials for the same provider
 - **Smart Error Detection**: Distinguishes between quota errors, rate limits, and capacity constraints
 - **Google Gemini Aware**: Waits for Gemini's internal retries to complete before failing over
 - **Cooldown Management**: Temporarily skips exhausted providers (default: 1 hour, configurable)
@@ -24,7 +24,6 @@ pi install npm:pi-high-availability
 ### 2. Create Configuration File
 
 ```bash
-# Create the config file
 pi -e pi-high-availability
 # Then run: /ha-init
 ```
@@ -90,127 +89,51 @@ Override the global cooldown for specific entries:
 }
 ```
 
-### Multiple Groups
-
-Create different groups for different use cases:
-
-```json
-{
-  "groups": {
-    "pro": {
-      "name": "Best Quality",
-      "entries": [
-        "anthropic/claude-3-5-sonnet",
-        "google-gemini-cli/gemini-1.5-pro",
-        "openai/gpt-4o"
-      ]
-    },
-    "fast": {
-      "name": "Fast & Cheap",
-      "entries": [
-        "google-gemini-cli/gemini-1.5-flash",
-        "groq/llama-3.1-70b",
-        "anthropic/claude-3-haiku"
-      ]
-    },
-    "coding": {
-      "name": "Coding Optimized",
-      "entries": [
-        "anthropic/claude-3-5-sonnet",
-        "openai/gpt-4o",
-        "google-gemini-cli/gemini-1.5-pro"
-      ]
-    }
-  },
-  "defaultGroup": "pro"
-}
-```
-
 ## 🔐 Multiple OAuth Accounts
 
-Pi only supports one OAuth credential per provider. To use multiple accounts with the same provider (e.g., two Google accounts), the HA extension provides a backup OAuth system.
+The extension automatically stores OAuth credentials in `~/.pi/agent/ha.json` and can switch between them during failover.
 
 ### How It Works
 
-The extension stores backup OAuth credentials in `~/.pi/agent/ha-oauth.json`, separate from pi's main `auth.json`. When you need to fail over, it swaps the credentials for you.
+When you run `/login` and authenticate with an OAuth provider:
+1. The extension automatically syncs the credential from `auth.json` to `ha.json`
+2. If the credential is new (different from existing ones), it's stored with a unique name
+3. During failover, the extension can switch between these stored credentials
 
-### Setting Up a Backup OAuth Account
+### Adding a Backup OAuth Account
 
-**Scenario**: You're logged into Google Gemini with your primary account. You want to add a backup account.
-
-#### Step 1: Save Current Credentials as "primary"
-
-```bash
-/ha-backup-create google-gemini-cli primary
-```
-
-This saves your current credentials as "primary" and clears them from `auth.json` so you can re-authenticate.
-
-#### Step 2: Authenticate with Backup Account
+**Scenario**: You have one Google account set up. You want to add a second.
 
 ```bash
-/login
-```
+# 1. Check current credentials
+/ha-status
 
-Select "Google Cloud Code Assist (Gemini CLI)" and complete the OAuth flow with your **backup** Google account.
-
-#### Step 3: Capture the Backup Credentials
-
-```bash
-/ha-backup-capture google-gemini-cli backup-1
-```
-
-This:
-1. Saves the new credentials as "backup-1" in `ha-oauth.json`
-2. Restores your primary credentials to `auth.json`
-
-You're now back to using your primary account, but the backup is stored for failover.
-
-### Managing OAuth Backups
-
-| Command | Description |
-|---------|-------------|
-| `/ha-backup-create <provider> <name>` | Save current credentials and prepare for re-auth |
-| `/ha-backup-capture <provider> <name>` | Capture new credentials and restore primary |
-| `/ha-backup-switch <provider> <name>` | Manually switch to a backup account |
-| `/ha-backup-list <provider>` | List all backups for a provider |
-
-### Automatic Failover with Backups
-
-When your primary OAuth account hits quota:
-
-1. Extension detects the quota error
-2. Automatically switches to an unused backup account
-3. Retries your message
-4. Notifies you: `"⚠️ Quota hit on google-gemini-cli! Switched to backup account 'backup-1'. Retrying..."`
-
-### Example: Complete OAuth Backup Setup
-
-```bash
-# You're already logged in with your primary Google account
-
-# 1. Save primary credentials
-/ha-backup-create google-gemini-cli primary
-
-# 2. Authenticate with backup account
+# 2. Run /login and authenticate with your second account
 /login
 # (Select Google Cloud Code Assist, login with backup Google account)
 
-# 3. Capture backup credentials
-/ha-backup-capture google-gemini-cli backup-1
+# 3. Sync the new credential to ha.json
+/ha-sync
 
-# 4. (Optional) Add more backups
-/ha-backup-create google-gemini-cli backup-1  # Save current (primary)
-/login  # Authenticate with third account
-/ha-backup-capture google-gemini-cli backup-2
-
-# 5. Check your backups
-/ha-backup-list google-gemini-cli
-# Output:
-#   primary (2026-02-24)
-#   backup-1 (2026-02-24)
-#   backup-2 (2026-02-24)
+# 4. Verify both credentials are stored
+/ha-status
 ```
+
+The output will show:
+```
+OAuth credentials stored:
+  google-gemini-cli: primary, backup-1 (active: primary)
+```
+
+### Manual Credential Switching
+
+To manually switch which OAuth credential is active:
+
+```bash
+/ha-switch google-gemini-cli backup-1
+```
+
+This swaps the credential in `auth.json` so you can test different accounts.
 
 ## 🎮 Commands
 
@@ -218,11 +141,9 @@ When your primary OAuth account hits quota:
 |---------|-------------|
 | `/ha-init` | Create a default `~/.pi/agent/ha.json` configuration |
 | `/ha-use <group>` | Switch to a different failover group |
-| `/ha-status` | Show active group, exhausted providers, and OAuth backups |
-| `/ha-backup-create <provider> <name>` | Save current OAuth and prepare for re-auth |
-| `/ha-backup-capture <provider> <name>` | Capture new OAuth credentials as backup |
-| `/ha-backup-switch <provider> <name>` | Manually switch to a backup OAuth account |
-| `/ha-backup-list <provider>` | List OAuth backups for a provider |
+| `/ha-status` | Show active group, exhausted providers, and stored OAuth credentials |
+| `/ha-sync` | Sync OAuth credentials from `auth.json` to `ha.json` |
+| `/ha-switch <provider> <name>` | Manually switch to a specific OAuth credential |
 
 ## 🔍 How It Works
 
@@ -250,37 +171,50 @@ The extension detects two categories of errors:
 ### Failover Flow
 
 1. **Error Detected**: Extension sees a quota/capacity error in the `turn_end` hook
-2. **Try OAuth Backup First**: If backups exist for the current provider, switch to an unused one
-3. **Mark Exhausted**: Current provider/backup is marked with a cooldown timestamp
-4. **Find Next**: Extension scans the group for the next available provider
+2. **Try Next OAuth Credential**: If multiple OAuth credentials exist for the provider, switch to the next one
+3. **Mark Exhausted**: If no more OAuth credentials, mark the provider as exhausted
+4. **Find Next Provider**: Scan the group for the next available provider
 5. **Switch**: Calls `pi.setModel()` to change to the new provider
 6. **Notify**: Shows you a message: "⚠️ Quota hit on anthropic! Switching to google..."
 7. **Retry**: Automatically resends your last message using `pi.sendUserMessage()`
 
 ### Loop Prevention
 
-- Each provider/backup combination is only tried **once per message**
+- Each provider/OAuth combination is only tried **once per message**
 - Cooldown prevents reusing exhausted providers (default: 1 hour)
-- If all providers and backups are exhausted, you get an error message
+- If all providers and OAuth credentials are exhausted, you get an error message
 
 ## 📊 Example Scenarios
 
-### Scenario 1: Anthropic Quota Exhausted
+### Scenario 1: OAuth Backup Chain
+
+**You**: "Generate unit tests for this function"
+
+**Primary Google Account**: ❌ Error: 429 - Quota exceeded
+
+**Extension**:
+1. Detects multiple OAuth credentials for `google-gemini-cli`
+2. Switches to `backup-1` credential
+3. Retries your message
+
+**Backup Google Account**: ✅ "Here are comprehensive unit tests..."
+
+### Scenario 2: Provider Failover
 
 **You**: "Refactor this authentication module"
 
 **Anthropic**: ❌ Error: 429 - You exceeded your current quota
 
 **Extension**:
-1. Marks `anthropic/claude-3-5-sonnet` as exhausted
-2. Finds next entry: `google-gemini-cli/gemini-1.5-pro`
-3. Switches model
-4. Notifies: "⚠️ Quota hit on anthropic! Switching to google..."
+1. No more OAuth credentials for Anthropic
+2. Marks `anthropic/claude-3-5-sonnet` as exhausted
+3. Finds next entry: `google-gemini-cli/gemini-1.5-pro`
+4. Switches model
 5. Retries your message
 
 **Google**: ✅ "Here's the refactored authentication module..."
 
-### Scenario 2: Google Gemini Capacity
+### Scenario 3: Google Gemini Capacity
 
 **You**: "Explain this regex pattern"
 
@@ -293,30 +227,9 @@ The extension detects two categories of errors:
 **Gemini** (final): ❌ Retry failed after 3 attempts
 
 **Extension**:
-1. Waits for final "Retry failed" message (ignores intermediate warnings)
-2. Checks for OAuth backups: Found "backup-1"
-3. Switches to backup account
-4. Retries with backup account
-
-**Gemini (backup)**: ✅ "This regex pattern uses lookahead assertions..."
-
-### Scenario 3: OAuth Backup Chain
-
-**You**: "Generate unit tests for this function"
-
-**Primary Google Account**: ❌ Error: 429 - Quota exceeded
-
-**Extension**:
-1. Switches to "backup-1" OAuth account
-2. Retries message
-
-**Backup-1 Google Account**: ❌ Error: 429 - Quota exceeded
-
-**Extension**:
-1. Switches to "backup-2" OAuth account
-2. Retries message
-
-**Backup-2 Google Account**: ✅ "Here are comprehensive unit tests..."
+1. Waits for final "Retry failed" message
+2. Switches to backup OAuth credential
+3. Retries with backup account
 
 ## ⚙️ Advanced Configuration
 
@@ -365,15 +278,15 @@ The extension will use the first available model from each provider.
 - Check if error message matches known patterns (see Error Detection section)
 - Verify you have authentication for fallback providers
 
-### OAuth backup not working
-- Run `/ha-backup-list <provider>` to verify backup exists
-- Check `~/.pi/agent/ha-oauth.json` exists and has your backup
-- Ensure you completed both `/ha-backup-create` and `/ha-backup-capture` steps
+### OAuth credentials not syncing
+- Run `/ha-sync` manually after `/login`
+- Check that `~/.pi/agent/ha.json` has an `oauth` section
+- Verify credentials are different (different refresh tokens)
 
 ### All providers exhausted
 - Wait for cooldown period to expire (default: 1 hour)
 - Restart pi to reset in-memory cooldowns
-- Add more providers or OAuth backups to your group
+- Add more providers or OAuth credentials to your group
 
 ## 📄 License
 

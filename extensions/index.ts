@@ -2,19 +2,10 @@
  * High Availability Provider Extension for Pi
  * 
  * Automatically switches to fallback providers when quota is exhausted.
- * Supports both API key and OAuth providers, with custom provider registration
- * for multiple OAuth accounts per provider.
+ * Supports multiple OAuth accounts per provider.
  */
 
-import type {
-  Api,
-  AssistantMessageEventStream,
-  Context,
-  Model,
-  OAuthCredentials,
-  OAuthLoginCallbacks,
-  SimpleStreamOptions,
-} from "@mariozechner/pi-ai";
+import type { Model } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { readFileSync, existsSync, writeFileSync } from "fs";
 import { join } from "path";
@@ -25,9 +16,7 @@ import { homedir } from "os";
 // =============================================================================
 
 interface HaGroupEntry {
-  /** Provider/model identifier. Can be "provider" or "provider/model-id" */
   id: string;
-  /** Cooldown duration in milliseconds after quota hit (default: 1 hour) */
   cooldownMs?: number;
 }
 
@@ -37,42 +26,14 @@ interface HaGroup {
 }
 
 interface HaConfig {
-  /** Provider groups for failover */
   groups: Record<string, HaGroup>;
-  /** Default group to use on startup */
   defaultGroup?: string;
-  /** Global default cooldown (default: 1 hour = 3600000ms) */
   defaultCooldownMs?: number;
-  /** Custom OAuth provider definitions for backup accounts */
-  customProviders?: CustomProviderDefinition[];
-}
-
-interface CustomProviderDefinition {
-  /** Unique ID for this custom provider (e.g., "ha-gemini-backup-1") */
-  id: string;
-  /** Display name for login UI */
-  name: string;
-  /** Base provider to mirror models from (e.g., "google-gemini-cli") */
-  mirrors: string;
-  /** API type */
-  api: string;
-  /** Base URL for API endpoint */
-  baseUrl: string;
-  /** OAuth configuration */
-  oauth: {
-    /** Authorization URL */
-    authorizeUrl: string;
-    /** Token URL */
-    tokenUrl: string;
-    /** Client ID (can be base64 encoded) */
-    clientId: string;
-    /** Redirect URI */
-    redirectUri: string;
-    /** OAuth scopes */
-    scopes: string;
-    /** Whether clientId is base64 encoded */
-    clientIdEncoded?: boolean;
-  };
+  /**
+   * OAuth storage - keyed by provider ID, contains multiple named credentials
+   * e.g., "google-gemini-cli": { "primary": {...}, "backup-1": {...} }
+   */
+  oauth?: Record<string, Record<string, any>>;
 }
 
 interface ExhaustedEntry {
@@ -86,17 +47,22 @@ interface HaState {
   exhausted: Map<string, ExhaustedEntry>;
   lastRetryMessage: string | null;
   isRetrying: boolean;
+  /**
+   * Track which OAuth credential is active for each provider
+   * e.g., "google-gemini-cli" -> "primary"
+   */
+  activeOAuth: Map<string, string>;
 }
 
 // =============================================================================
 // Configuration
 // =============================================================================
 
-const CONFIG_PATH = join(homedir(), ".pi", "ha.json");
-const DEFAULT_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+const AGENT_DIR = join(homedir(), ".pi", "agent");
+const CONFIG_PATH = join(AGENT_DIR, "ha.json");
+const AUTH_PATH = join(AGENT_DIR, "auth.json");
+const DEFAULT_COOLDOWN_MS = 60 * 60 * 1000;
 
-// Quota error patterns to detect
-// Quota error patterns - trigger immediately
 const QUOTA_ERROR_PATTERNS = [
   /429/i,
   /quota exceeded/i,
@@ -108,7 +74,6 @@ const QUOTA_ERROR_PATTERNS = [
   /billing.*exhausted/i,
 ];
 
-// Capacity error patterns - trigger immediately for most providers
 const CAPACITY_ERROR_PATTERNS = [
   /capacity constraints/i,
   /engine overloaded/i,
@@ -117,7 +82,6 @@ const CAPACITY_ERROR_PATTERNS = [
   /temporarily unavailable/i,
 ];
 
-// Google Gemini specific: only trigger on final "Retry failed" message
 const GEMINI_FINAL_RETRY_PATTERN = /retry failed after \d+ attempts/i;
 
 // =============================================================================
@@ -129,12 +93,13 @@ const state: HaState = {
   exhausted: new Map(),
   lastRetryMessage: null,
   isRetrying: false,
+  activeOAuth: new Map(),
 };
 
 let config: HaConfig | null = null;
 
 // =============================================================================
-// Configuration Loader
+// Configuration Functions
 // =============================================================================
 
 function loadConfig(): HaConfig | null {
@@ -159,50 +124,169 @@ function saveConfig(cfg: HaConfig): void {
   }
 }
 
+function loadAuthJson(): Record<string, any> {
+  if (!existsSync(AUTH_PATH)) {
+    return {};
+  }
+  try {
+    const content = readFileSync(AUTH_PATH, "utf-8");
+    return JSON.parse(content);
+  } catch (err) {
+    console.error("[HA] Failed to load auth.json:", err);
+    return {};
+  }
+}
+
+function saveAuthJson(auth: Record<string, any>): void {
+  try {
+    writeFileSync(AUTH_PATH, JSON.stringify(auth, null, 2), "utf-8");
+  } catch (err) {
+    console.error("[HA] Failed to save auth.json:", err);
+  }
+}
+
+// =============================================================================
+// OAuth Sync Functions
+// =============================================================================
+
+/**
+ * Sync OAuth entries from auth.json to ha.json
+ * Preserves existing entries in ha.json, adds new ones with unique names
+ */
+function syncOAuthToHa(): void {
+  if (!config) return;
+
+  const auth = loadAuthJson();
+  if (!config.oauth) {
+    config.oauth = {};
+  }
+
+  let changed = false;
+
+  for (const [providerId, credentials] of Object.entries(auth)) {
+    if (credentials.type !== "oauth") continue;
+
+    // Initialize provider entry if needed
+    if (!config.oauth[providerId]) {
+      config.oauth[providerId] = {};
+    }
+
+    const existingEntries = config.oauth[providerId];
+    
+    // Check if this exact credential already exists
+    let found = false;
+    for (const [name, existingCreds] of Object.entries(existingEntries)) {
+      if (credentialsMatch(credentials, existingCreds)) {
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      // Find a unique name
+      let name = "primary";
+      if (existingEntries["primary"]) {
+        let counter = 1;
+        while (existingEntries[`backup-${counter}`]) {
+          counter++;
+        }
+        name = `backup-${counter}`;
+      }
+      
+      existingEntries[name] = credentials;
+      changed = true;
+      console.log(`[HA] Synced OAuth for ${providerId} as "${name}"`);
+    }
+  }
+
+  if (changed) {
+    saveConfig(config);
+  }
+}
+
+/**
+ * Check if two credential objects match (by refresh token or key fields)
+ */
+function credentialsMatch(a: any, b: any): boolean {
+  if (a.type !== b.type) return false;
+  
+  if (a.type === "oauth") {
+    // Compare by refresh token (most reliable identifier)
+    return a.refresh === b.refresh;
+  }
+  
+  if (a.type === "api_key") {
+    return a.key === b.key;
+  }
+  
+  return false;
+}
+
+/**
+ * Switch to a specific OAuth credential for a provider
+ */
+function switchOAuthCredential(providerId: string, credentialName: string): boolean {
+  if (!config?.oauth?.[providerId]?.[credentialName]) {
+    return false;
+  }
+
+  const auth = loadAuthJson();
+  auth[providerId] = config.oauth[providerId][credentialName];
+  saveAuthJson(auth);
+  
+  state.activeOAuth.set(providerId, credentialName);
+  return true;
+}
+
+/**
+ * Get next available OAuth credential for a provider
+ */
+function getNextOAuthCredential(providerId: string): string | null {
+  if (!config?.oauth?.[providerId]) return null;
+
+  const entries = config.oauth[providerId];
+  const current = state.activeOAuth.get(providerId) || "primary";
+  
+  // Get all credential names
+  const names = Object.keys(entries);
+  if (names.length <= 1) return null;
+
+  // Find current index and return next
+  const currentIndex = names.indexOf(current);
+  if (currentIndex === -1) return names[0];
+  
+  const nextIndex = (currentIndex + 1) % names.length;
+  return names[nextIndex];
+}
+
 // =============================================================================
 // Utility Functions
 // =============================================================================
 
-/**
- * Check if error is a quota/rate limit error (trigger immediately)
- */
 function isQuotaError(errorMessage: string | undefined): boolean {
   if (!errorMessage) return false;
   const lowerMsg = errorMessage.toLowerCase();
   return QUOTA_ERROR_PATTERNS.some((pattern) => pattern.test(lowerMsg));
 }
 
-/**
- * Check if error is a capacity error.
- * For Google Gemini: only trigger on final "Retry failed" message.
- * For other providers: trigger on immediate capacity errors.
- */
 function isCapacityError(errorMessage: string | undefined, provider?: string): boolean {
   if (!errorMessage) return false;
   const lowerMsg = errorMessage.toLowerCase();
 
-  // Google Gemini specific: only trigger on "Retry failed after N attempts"
-  // This indicates the internal retries have exhausted
   if (provider?.includes("google") || provider?.includes("gemini")) {
-    // Check if it's the final retry failure
     if (GEMINI_FINAL_RETRY_PATTERN.test(lowerMsg)) {
       console.log("[HA] Detected Gemini final retry failure");
       return true;
     }
-    // Don't trigger on intermediate "No capacity" messages
     if (/no capacity available/.test(lowerMsg)) {
-      console.log("[HA] Ignoring intermediate Gemini capacity error (waiting for final retry)");
+      console.log("[HA] Ignoring intermediate Gemini capacity error");
       return false;
     }
   }
 
-  // For other providers, trigger on immediate capacity errors
   return CAPACITY_ERROR_PATTERNS.some((pattern) => pattern.test(lowerMsg));
 }
 
-/**
- * Check if error should trigger failover
- */
 function shouldTriggerFailover(errorMessage: string | undefined, provider?: string): boolean {
   return isQuotaError(errorMessage) || isCapacityError(errorMessage, provider);
 }
@@ -210,14 +294,13 @@ function shouldTriggerFailover(errorMessage: string | undefined, provider?: stri
 function isExhausted(entryId: string): boolean {
   const entry = state.exhausted.get(entryId);
   if (!entry) return false;
-  
+
   const now = Date.now();
   if (now - entry.exhaustedAt >= entry.cooldownMs) {
-    // Cooldown expired, remove from exhausted list
     state.exhausted.delete(entryId);
     return false;
   }
-  
+
   return true;
 }
 
@@ -229,174 +312,12 @@ function markExhausted(entryId: string, cooldownMs: number): void {
   });
 }
 
-function getCooldownMs(entry: HaGroupEntry, globalDefault: number): number {
-  return entry.cooldownMs ?? globalDefault;
-}
-
 function parseEntryId(entryId: string): { provider: string; modelId?: string } {
   const parts = entryId.split("/");
   if (parts.length === 2) {
     return { provider: parts[0], modelId: parts[1] };
   }
   return { provider: entryId };
-}
-
-// =============================================================================
-// PKCE Utilities for OAuth
-// =============================================================================
-
-async function generatePKCE(): Promise<{ verifier: string; challenge: string }> {
-  const array = new Uint8Array(32);
-  crypto.getRandomValues(array);
-  const verifier = btoa(String.fromCharCode(...array))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-
-  const encoder = new TextEncoder();
-  const data = encoder.encode(verifier);
-  const hash = await crypto.subtle.digest("SHA-256", data);
-  const challenge = btoa(String.fromCharCode(...new Uint8Array(hash)))
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-
-  return { verifier, challenge };
-}
-
-// =============================================================================
-// Custom Provider Registration
-// =============================================================================
-
-function registerCustomProviders(pi: ExtensionAPI, cfg: HaConfig): void {
-  if (!cfg.customProviders) return;
-
-  const availableModels = pi.getAvailableModels?.() || [];
-
-  for (const customProvider of cfg.customProviders) {
-    // Find models to mirror from the base provider
-    const modelsToMirror = availableModels.filter(
-      (m) => m.provider === customProvider.mirrors
-    );
-
-    if (modelsToMirror.length === 0) {
-      console.warn(
-        `[HA] No models found to mirror from ${customProvider.mirrors} for ${customProvider.id}`
-      );
-      continue;
-    }
-
-    // Mirror models with new provider name
-    const mirroredModels = modelsToMirror.map((model) => ({
-      id: model.id,
-      name: `${model.name} (${customProvider.name})`,
-      api: customProvider.api as Api,
-      reasoning: model.reasoning ?? false,
-      input: model.input ?? (["text"] as ("text" | "image")[]),
-      cost: model.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      contextWindow: model.contextWindow ?? 128000,
-      maxTokens: model.maxTokens ?? 4096,
-    }));
-
-    // Decode client ID if needed
-    const clientId = customProvider.oauth.clientIdEncoded
-      ? atob(customProvider.oauth.clientId)
-      : customProvider.oauth.clientId;
-
-    // Register the custom provider with OAuth
-    pi.registerProvider(customProvider.id, {
-      baseUrl: customProvider.baseUrl,
-      api: customProvider.api as Api,
-      models: mirroredModels,
-      oauth: {
-        name: customProvider.name,
-        login: async (callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> => {
-          const { verifier, challenge } = await generatePKCE();
-
-          const authParams = new URLSearchParams({
-            code: "true",
-            client_id: clientId,
-            response_type: "code",
-            redirect_uri: customProvider.oauth.redirectUri,
-            scope: customProvider.oauth.scopes,
-            code_challenge: challenge,
-            code_challenge_method: "S256",
-            state: verifier,
-          });
-
-          callbacks.onAuth({
-            url: `${customProvider.oauth.authorizeUrl}?${authParams.toString()}`,
-          });
-
-          const authCode = await callbacks.onPrompt({
-            message: "Paste the authorization code:",
-          });
-          const [code, stateValue] = authCode.split("#");
-
-          const tokenResponse = await fetch(customProvider.oauth.tokenUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              grant_type: "authorization_code",
-              client_id: clientId,
-              code,
-              state: stateValue,
-              redirect_uri: customProvider.oauth.redirectUri,
-              code_verifier: verifier,
-            }),
-          });
-
-          if (!tokenResponse.ok) {
-            throw new Error(`Token exchange failed: ${await tokenResponse.text()}`);
-          }
-
-          const data = (await tokenResponse.json()) as {
-            access_token: string;
-            refresh_token: string;
-            expires_in: number;
-          };
-
-          return {
-            refresh: data.refresh_token,
-            access: data.access_token,
-            expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-          };
-        },
-        refreshToken: async (credentials: OAuthCredentials): Promise<OAuthCredentials> => {
-          const response = await fetch(customProvider.oauth.tokenUrl, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              grant_type: "refresh_token",
-              client_id: clientId,
-              refresh_token: credentials.refresh,
-            }),
-          });
-
-          if (!response.ok) {
-            throw new Error(`Token refresh failed: ${await response.text()}`);
-          }
-
-          const data = (await response.json()) as {
-            access_token: string;
-            refresh_token: string;
-            expires_in: number;
-          };
-
-          return {
-            refresh: data.refresh_token,
-            access: data.access_token,
-            expires: Date.now() + data.expires_in * 1000 - 5 * 60 * 1000,
-          };
-        },
-        getApiKey: (cred: OAuthCredentials) => cred.access,
-      },
-    });
-
-    console.log(
-      `[HA] Registered custom provider: ${customProvider.id} with ${mirroredModels.length} models`
-    );
-  }
 }
 
 // =============================================================================
@@ -418,13 +339,11 @@ async function findNextAvailableProvider(
   for (const entry of group.entries) {
     const { provider, modelId } = parseEntryId(entry.id);
 
-    // Skip if this entry is currently exhausted
     if (isExhausted(entry.id)) {
       console.log(`[HA] Skipping exhausted entry: ${entry.id}`);
       continue;
     }
 
-    // Get available models for this provider
     const availableModels = ctx.modelRegistry.getAvailable().filter(
       (m: Model<any>) => m.provider === provider
     );
@@ -434,7 +353,6 @@ async function findNextAvailableProvider(
       continue;
     }
 
-    // Select the model
     let selectedModel: Model<any>;
     if (modelId) {
       selectedModel = availableModels.find((m: Model<any>) => m.id === modelId);
@@ -443,11 +361,9 @@ async function findNextAvailableProvider(
         continue;
       }
     } else {
-      // Pick the first available model (or try to match capability tier)
       selectedModel = availableModels[0];
     }
 
-    // Check if we have auth for this model
     const apiKey = await ctx.modelRegistry.getApiKey(selectedModel);
     if (!apiKey) {
       console.log(`[HA] No API key available for ${selectedModel.provider}/${selectedModel.id}`);
@@ -465,33 +381,28 @@ async function findNextAvailableProvider(
 // =============================================================================
 
 export default function (pi: ExtensionAPI) {
-  // Load configuration
   config = loadConfig();
 
-  if (!config) {
+  if (config) {
+    if (config.defaultGroup && config.groups[config.defaultGroup]) {
+      state.activeGroup = config.defaultGroup;
+      console.log(`[HA] Active group: ${state.activeGroup}`);
+    }
+    // Sync OAuth on startup
+    syncOAuthToHa();
+  } else {
     console.log("[HA] No ha.json found. Run /ha-init to create one.");
-    return;
-  }
-
-  // Register custom providers for backup OAuth accounts
-  registerCustomProviders(pi, config);
-
-  // Set initial active group
-  if (config.defaultGroup && config.groups[config.defaultGroup]) {
-    state.activeGroup = config.defaultGroup;
-    console.log(`[HA] Active group: ${state.activeGroup}`);
   }
 
   // =============================================================================
   // Commands
   // =============================================================================
 
-  // Initialize HA configuration
   pi.registerCommand("ha-init", {
     description: "Initialize HA configuration file",
     handler: async (_args, ctx) => {
       if (existsSync(CONFIG_PATH)) {
-        ctx.ui.notify("HA configuration already exists at ~/.pi/ha.json", "warning");
+        ctx.ui.notify("HA configuration already exists at ~/.pi/agent/ha.json", "warning");
         return;
       }
 
@@ -507,14 +418,14 @@ export default function (pi: ExtensionAPI) {
         },
         defaultGroup: "default",
         defaultCooldownMs: DEFAULT_COOLDOWN_MS,
+        oauth: {},
       };
 
       saveConfig(defaultConfig);
-      ctx.ui.notify("Created ~/.pi/ha.json. Edit it to configure your failover groups.", "info");
+      ctx.ui.notify("Created ~/.pi/agent/ha.json. Edit it to configure your failover groups.", "info");
     },
   });
 
-  // Switch active group
   pi.registerCommand("ha-use", {
     description: "Switch to a failover group",
     handler: async (args, ctx) => {
@@ -530,12 +441,11 @@ export default function (pi: ExtensionAPI) {
       }
 
       state.activeGroup = groupName;
-      state.exhausted.clear(); // Clear exhausted state when switching groups
+      state.exhausted.clear();
       ctx.ui.notify(`Switched to HA group: ${groupName}`, "info");
     },
   });
 
-  // Show HA status
   pi.registerCommand("ha-status", {
     description: "Show HA status and exhausted providers",
     handler: async (_args, ctx) => {
@@ -553,8 +463,22 @@ export default function (pi: ExtensionAPI) {
         lines.push(`Group '${state.activeGroup}' entries:`);
         for (const entry of group.entries) {
           const exhausted = isExhausted(entry.id);
+          const { provider } = parseEntryId(entry.id);
+          const activeOAuth = state.activeOAuth.get(provider);
+          const oauthInfo = activeOAuth ? ` [${activeOAuth}]` : "";
           const status = exhausted ? "❌ exhausted" : "✅ available";
-          lines.push(`  ${entry.id} - ${status}`);
+          lines.push(`  ${entry.id}${oauthInfo} - ${status}`);
+        }
+      }
+
+      // Show OAuth credentials
+      if (config.oauth && Object.keys(config.oauth).length > 0) {
+        lines.push("");
+        lines.push("OAuth credentials stored:");
+        for (const [providerId, entries] of Object.entries(config.oauth)) {
+          const names = Object.keys(entries);
+          const active = state.activeOAuth.get(providerId) || "primary";
+          lines.push(`  ${providerId}: ${names.join(", ")} (active: ${active})`);
         }
       }
 
@@ -572,26 +496,54 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("ha-sync", {
+    description: "Sync OAuth credentials from auth.json to ha.json",
+    handler: async (_args, ctx) => {
+      if (!config) {
+        ctx.ui.notify("HA not configured. Run /ha-init first.", "warning");
+        return;
+      }
+
+      syncOAuthToHa();
+      ctx.ui.notify("Synced OAuth credentials from auth.json to ha.json", "info");
+    },
+  });
+
+  pi.registerCommand("ha-switch", {
+    description: "Switch to a different OAuth credential for a provider",
+    handler: async (args, ctx) => {
+      const parts = args.trim().split(" ");
+      if (parts.length < 2) {
+        ctx.ui.notify("Usage: /ha-switch <provider> <credential-name>", "error");
+        ctx.ui.notify("Example: /ha-switch google-gemini-cli backup-1", "info");
+        return;
+      }
+
+      const [providerId, credentialName] = parts;
+
+      const success = switchOAuthCredential(providerId, credentialName);
+      if (success) {
+        ctx.ui.notify(`Switched ${providerId} to "${credentialName}"`, "info");
+      } else {
+        ctx.ui.notify(`Failed to switch. Credential "${credentialName}" not found for ${providerId}.`, "error");
+      }
+    },
+  });
+
   // =============================================================================
   // Failover Hook
   // =============================================================================
 
   pi.on("turn_end", async (event, ctx) => {
-    // Skip if no config or no active group
     if (!config || !state.activeGroup) return;
-
-    // Skip if we're already in a retry (prevent loops)
     if (state.isRetrying) return;
 
-    // Check if this turn resulted in a quota error
     const message = event.message;
     if (!message || message.role !== "assistant") return;
 
-    // Check for error stop reason or error message
     const hasError = message.stopReason === "error" || message.errorMessage;
     if (!hasError) return;
 
-    // Check if it's a quota or capacity error
     const currentModel = ctx.model;
     const currentProvider = currentModel?.provider;
 
@@ -602,6 +554,42 @@ export default function (pi: ExtensionAPI) {
 
     console.log(`[HA] Failover error detected: ${message.errorMessage}`);
 
+    // Try switching to next OAuth credential first
+    if (currentProvider) {
+      const nextCredential = getNextOAuthCredential(currentProvider);
+      if (nextCredential) {
+        console.log(`[HA] Trying OAuth credential "${nextCredential}" for ${currentProvider}`);
+        const switched = switchOAuthCredential(currentProvider, nextCredential);
+        if (switched) {
+          ctx.ui.notify(
+            `⚠️ ${isCapacityError(message.errorMessage, currentProvider) ? "Capacity" : "Quota"} hit!\n` +
+            `Switched ${currentProvider} to "${nextCredential}". Retrying...`,
+            "warning"
+          );
+
+          // Retry the message
+          const branch = ctx.sessionManager.getBranch();
+          const lastUserMessage = branch
+            .slice()
+            .reverse()
+            .find((entry: any) => entry.type === "message" && entry.message?.role === "user");
+
+          if (lastUserMessage) {
+            state.isRetrying = true;
+            state.lastRetryMessage = typeof lastUserMessage.message.content === "string"
+              ? lastUserMessage.message.content
+              : JSON.stringify(lastUserMessage.message.content);
+
+            await new Promise((resolve) => setTimeout(resolve, 500));
+            pi.sendUserMessage(lastUserMessage.message.content, { deliverAs: "steer" });
+
+            setTimeout(() => { state.isRetrying = false; }, 5000);
+          }
+          return;
+        }
+      }
+    }
+
     // Mark current provider as exhausted
     if (currentModel) {
       const currentEntryId = `${currentModel.provider}/${currentModel.id}`;
@@ -610,27 +598,27 @@ export default function (pi: ExtensionAPI) {
       console.log(`[HA] Marked ${currentEntryId} as exhausted`);
     }
 
-    // Find next available provider
+    // Find next available provider in group
     const next = await findNextAvailableProvider(pi, ctx, currentModel);
     if (!next) {
       ctx.ui.notify("⚠️ All providers in group exhausted. No failover available.", "error");
       return;
     }
 
-    // Notify user
+    // Notify and switch
     const fromProvider = currentModel
       ? `${currentModel.provider}/${currentModel.id}`
       : "current";
     const toProvider = `${next.model.provider}/${next.model.id}`;
-    const errorType = isCapacityError(message.errorMessage, currentProvider) 
-      ? "Capacity exhausted" 
+    const errorType = isCapacityError(message.errorMessage, currentProvider)
+      ? "Capacity exhausted"
       : "Quota hit";
+
     ctx.ui.notify(
       `⚠️ ${errorType} on ${fromProvider}!\nSwitching to ${toProvider}...`,
       "warning"
     );
 
-    // Switch model
     const success = await pi.setModel(next.model);
     if (!success) {
       ctx.ui.notify(`Failed to switch to ${toProvider}. Check authentication.`, "error");
@@ -639,7 +627,7 @@ export default function (pi: ExtensionAPI) {
 
     console.log(`[HA] Switched to ${toProvider}`);
 
-    // Get the last user message for retry
+    // Retry the message
     const branch = ctx.sessionManager.getBranch();
     const lastUserMessage = branch
       .slice()
@@ -651,25 +639,20 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    // Prevent duplicate retries
-    const messageContent =
-      typeof lastUserMessage.message.content === "string"
-        ? lastUserMessage.message.content
-        : JSON.stringify(lastUserMessage.message.content);
+    const messageContent = typeof lastUserMessage.message.content === "string"
+      ? lastUserMessage.message.content
+      : JSON.stringify(lastUserMessage.message.content);
 
     if (state.lastRetryMessage === messageContent) {
       console.log("[HA] Already retried this message, skipping");
       return;
     }
 
-    // Mark as retrying and store message
     state.isRetrying = true;
     state.lastRetryMessage = messageContent;
 
-    // Wait a moment for the model switch to settle
     await new Promise((resolve) => setTimeout(resolve, 500));
 
-    // Resend the message
     try {
       console.log("[HA] Retrying last message...");
       pi.sendUserMessage(lastUserMessage.message.content, { deliverAs: "steer" });
@@ -678,16 +661,12 @@ export default function (pi: ExtensionAPI) {
       console.error("[HA] Failed to retry message:", err);
       ctx.ui.notify("Failed to retry message. Please try manually.", "error");
     } finally {
-      // Reset retry flag after a delay
-      setTimeout(() => {
-        state.isRetrying = false;
-      }, 5000);
+      setTimeout(() => { state.isRetrying = false; }, 5000);
     }
   });
 
-  // Reset retry flag on successful message (non-error turn)
+  // Reset retry flag on successful turn
   pi.on("turn_start", async (_event, _ctx) => {
-    // Clear retry state when a new turn starts successfully
     if (state.lastRetryMessage && !state.isRetrying) {
       state.lastRetryMessage = null;
     }
