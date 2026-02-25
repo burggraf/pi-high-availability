@@ -4,7 +4,7 @@
 
 ## ✨ Features
 
-- **Unified HA Manager**: A beautiful interactive TUI (`/ha`) to manage all your groups and credentials in one place.
+- **Unified HA Manager**: A beautiful interactive TUI (`/ha`) with accordion-style navigation to manage all your groups and credentials in one place.
 - **Automatic Multi-Tier Failover**: 
     1. **Account Failover**: Seamlessly switches between multiple accounts for the *same* provider.
     2. **Provider Failover**: Automatically jumps to the next provider in your group if all accounts for the current provider are exhausted.
@@ -41,16 +41,31 @@ Run the High Availability manager to initialize your configuration:
 
 The interactive manager is your control center for high availability.
 
+### Keyboard Navigation
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Navigate items |
+| `Space` / `→` | Expand/collapse section or toggle item |
+| `Enter` | Select/activate item |
+| `x` / `d` / `Delete` | Delete currently selected item (with confirmation) |
+| `u` | Move item up (reorder) |
+| `d` | Move item down (reorder) |
+| `Esc` | Cancel / Exit |
+
 ### 📂 Group Management
 *   **Add/Rename/Delete** groups.
 *   **Rearrange Priority**: Use **`u`** (up) and **`d`** (down) keys to set the failover order of models within a group.
 *   **Per-Entry Cooldown**: Set custom recovery times for specific models.
+*   **Delete Models**: Navigate to any model entry and press **`x`** to remove it from the group.
 
 ### 🔑 Credential Management
-*   **Sync from auth.json**: Instantly capture any accounts you've logged into via `/login`.
-*   **Add Provider**: Guided setup for **🔑 API Key** or **🌐 OAuth / SSO** providers.
+*   **Auto-Sync**: Credentials from `/login` are automatically synced when you open `/ha`.
+*   **Add API Providers**: Use **"+ Add API Provider"** to manually add providers that use API keys.
+*   **Add API Keys**: For non-OAuth providers, add additional API keys as backups.
 *   **Account Priority**: Use **`u`** and **`d`** keys to decide which account is `primary` and which are `backup-1`, `backup-2`, etc.
-*   **Activate**: Manually "push" any stored HA credential into Pi's active `auth.json`.
+*   **Delete Keys**: Navigate to any key entry and press **`x`** to delete it.
+*   **Delete Providers**: Navigate to a provider header (e.g., `🔌 google-gemini-cli`) and press **`x`** to delete the entire provider and all its keys.
 
 ### ⏱️ Settings
 *   **Default Cooldown**: Set the default recovery time (e.g., 3600000ms for 1 hour) for exhausted providers.
