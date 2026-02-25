@@ -174,14 +174,6 @@ export class HaUi {
         });
 
         credItems.push({
-          id: `login-${provider}`,
-          label: `  🌐 Login Browser (/login)`,
-          action: () => {
-            this.onDone({ action: "oauth", provider, config: this.config });
-          }
-        });
-
-        credItems.push({
           id: `add-key-${provider}`,
           label: `  + Add Key to ${provider}`,
           action: () => {
@@ -286,6 +278,17 @@ export class HaUi {
         } },
         { id: "cancel", label: "❌ Cancel", action: () => {
           this.onDone(null);
+        } }
+      ]
+    });
+
+    sections.push({
+      id: "help",
+      label: "❓ Help",
+      content: new Container(),
+      items: [
+        { id: "login-info", label: "🔑 How to add OAuth?", action: () => {
+          this.ctx.ui.notify("Run /login in the main editor to add Google, Claude, or ChatGPT Plus accounts.", "info");
         } }
       ]
     });
