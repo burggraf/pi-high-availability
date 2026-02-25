@@ -176,7 +176,13 @@ export class HaUi {
         credItems.push({ 
           id: `provider-${provider}`, 
           label: `🔌 ${provider}${isOAuth ? " (OAuth)" : ""}`, 
-          action: () => {} 
+          action: () => {},
+          onDelete: () => {
+            this.showConfirm(`Delete provider '${provider}' and all its keys?`, () => {
+              delete this.config.credentials![provider];
+              this.accordion.setSections(this.buildSections());
+            });
+          }
         });
         
         Object.entries(creds).forEach(([name, cred]) => {
@@ -218,16 +224,6 @@ export class HaUi {
           });
         }
 
-        credItems.push({
-          id: `delete-provider-${provider}`,
-          label: `  🗑️ Delete Provider ${provider}`,
-          action: () => {
-            this.showConfirm(`Delete provider '${provider}' and all its keys?`, () => {
-              delete this.config.credentials![provider];
-              this.accordion.setSections(this.buildSections());
-            });
-          }
-        });
         credItems.push({ id: `spacer-provider-${provider}`, label: "", action: () => {} });
       });
     }
