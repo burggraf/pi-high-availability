@@ -161,8 +161,8 @@ export default function (pi: ExtensionAPI) {
               await loop();
           } else if (result.action === "oauth") {
               saveConfig(result.config);
-              ctx.ui.notify(`Logging in to ${result.provider}...`, "info");
-              await pi.sendUserMessage(`/login ${result.provider}`, { deliverAs: "steer" });
+              ctx.ui.notify(`Running /login...`, "info");
+              await pi.sendUserMessage("/login", { deliverAs: "steer" });
           } else {
               saveConfig(result.config);
               state.activeGroup = result.activeGroup;

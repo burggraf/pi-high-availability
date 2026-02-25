@@ -175,7 +175,7 @@ export class HaUi {
 
         credItems.push({
           id: `login-${provider}`,
-          label: `  🌐 Login Browser (/login ${provider})`,
+          label: `  🌐 Login Browser (/login)`,
           action: () => {
             this.onDone({ action: "oauth", provider, config: this.config });
           }
