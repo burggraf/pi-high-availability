@@ -131,13 +131,15 @@ export default function (pi: ExtensionAPI) {
         config = { groups: {}, credentials: {}, defaultCooldownMs: 5000 };
         saveConfig(config);
       }
+      
+      syncAuthToHa(); // Ensure we are up-to-date with auth.json on open
 
       const loop = async () => {
           const result = await ctx.ui.custom<any | null>(
             (tui, theme, _kb, done) => {
               const haUi = new HaUi(ctx, config!, state.activeGroup, (res) => done(res));
               return {
-                render: (w) => haUi.render(w, theme),
+                render: (w) => haUi.render(w),
                 handleInput: (data) => haUi.handleInput(data, tui),
                 invalidate: () => haUi.invalidate(),
               };

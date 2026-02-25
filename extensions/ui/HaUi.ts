@@ -174,6 +174,14 @@ export class HaUi {
         });
 
         credItems.push({
+          id: `login-${provider}`,
+          label: `  🌐 Login Browser (/login ${provider})`,
+          action: () => {
+            this.onDone({ action: "oauth", provider, config: this.config });
+          }
+        });
+
+        credItems.push({
           id: `add-key-${provider}`,
           label: `  + Add Key to ${provider}`,
           action: () => {
