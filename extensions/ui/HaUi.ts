@@ -119,6 +119,18 @@ export class HaUi {
           });
         }
       });
+
+      groupItems.push({
+        id: `delete-group-${name}`,
+        label: `  🗑️ Delete Group ${name}`,
+        action: () => {
+          delete this.config.groups[name];
+          if (this.config.defaultGroup === name) delete this.config.defaultGroup;
+          if (this.activeGroup === name) this.activeGroup = null;
+          this.accordion.setSections(this.buildSections());
+        }
+      });
+      groupItems.push({ id: `spacer-group-${name}`, label: "", action: () => {} });
     });
 
     groupItems.push({
@@ -155,20 +167,58 @@ export class HaUi {
             id: `cred-${provider}-${name}`,
             label: `  ${status}${name}`,
             action: () => {
-              // this.onDone({ action: "activate", provider, name, config: this.config }); // DON'T CALL onDone
               state.activeCredential.set(provider, name);
               this.accordion.setSections(this.buildSections());
             }
           });
         });
+
+        credItems.push({
+          id: `add-key-${provider}`,
+          label: `  + Add Key to ${provider}`,
+          action: () => {
+            this.showInput("API Key", "", (key) => {
+              if (key) {
+                const stored = this.config.credentials![provider];
+                const count = Object.keys(stored).filter(k => k !== "type").length;
+                const name = stored["primary"] ? `backup-${count}` : "primary";
+                stored[name] = { key, type: "api_key" };
+                this.accordion.setSections(this.buildSections());
+              }
+            });
+          }
+        });
+
+        credItems.push({
+          id: `delete-provider-${provider}`,
+          label: `  🗑️ Delete Provider ${provider}`,
+          action: () => {
+            delete this.config.credentials![provider];
+            this.accordion.setSections(this.buildSections());
+          }
+        });
+        credItems.push({ id: `spacer-provider-${provider}`, label: "", action: () => {} });
       });
     }
+
+    credItems.push({
+      id: "add-provider",
+      label: "+ Add Provider",
+      action: () => {
+        this.showInput("Provider ID (e.g. anthropic, openai)", "", (pid) => {
+          if (pid) {
+            if (!this.config.credentials) this.config.credentials = {};
+            if (!this.config.credentials[pid]) this.config.credentials[pid] = {};
+            this.accordion.setSections(this.buildSections());
+          }
+        });
+      }
+    });
 
     credItems.push({
       id: "sync-auth",
       label: "🔄 Sync from auth.json",
       action: () => {
-        // this.onDone({ action: "sync", config: this.config }); // DON'T CALL onDone
         updateActiveCredentialsFromAuth(this.config);
         this.accordion.setSections(this.buildSections());
       }
@@ -189,10 +239,12 @@ export class HaUi {
         label: `🎯 Default Group: ${this.config.defaultGroup || "None"}`,
         action: () => {
           const names = Object.keys(this.config.groups);
-          const current = this.config.defaultGroup || "";
-          const nextIdx = (names.indexOf(current) + 1) % names.length;
-          this.config.defaultGroup = names[nextIdx];
-          this.accordion.setSections(this.buildSections());
+          if (names.length > 0) {
+            const current = this.config.defaultGroup || "";
+            const nextIdx = (names.indexOf(current) + 1) % names.length;
+            this.config.defaultGroup = names[nextIdx];
+            this.accordion.setSections(this.buildSections());
+          }
         }
       },
       {
