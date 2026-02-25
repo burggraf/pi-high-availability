@@ -158,7 +158,15 @@ export class HaUi {
     const credItems: any[] = [];
     if (this.config.credentials) {
       Object.entries(this.config.credentials).forEach(([provider, creds]) => {
-        credItems.push({ id: `provider-${provider}`, label: `🔌 ${provider}`, action: () => {} });
+        // Detect if this provider is an OAuth provider (has entries with refresh tokens)
+        const isOAuth = Object.values(creds).some(c => c && typeof c === 'object' && 'refresh' in c);
+        
+        credItems.push({ 
+          id: `provider-${provider}`, 
+          label: `🔌 ${provider}${isOAuth ? " (OAuth)" : ""}`, 
+          action: () => {} 
+        });
+        
         Object.entries(creds).forEach(([name, cred]) => {
           if (name === "type") return;
           const isActive = state.activeCredential.get(provider) === name;
@@ -173,21 +181,24 @@ export class HaUi {
           });
         });
 
-        credItems.push({
-          id: `add-key-${provider}`,
-          label: `  + Add Key to ${provider}`,
-          action: () => {
-            this.showInput("API Key", "", (key) => {
-              if (key) {
-                const stored = this.config.credentials![provider];
-                const count = Object.keys(stored).filter(k => k !== "type").length;
-                const name = stored["primary"] ? `backup-${count}` : "primary";
-                stored[name] = { key, type: "api_key" };
-                this.accordion.setSections(this.buildSections());
-              }
-            });
-          }
-        });
+        // Only show "Add Key" for non-OAuth providers
+        if (!isOAuth) {
+          credItems.push({
+            id: `add-key-${provider}`,
+            label: `  + Add API Key to ${provider}`,
+            action: () => {
+              this.showInput("API Key", "", (key) => {
+                if (key) {
+                  const stored = this.config.credentials![provider];
+                  const count = Object.keys(stored).filter(k => k !== "type").length;
+                  const name = stored["primary"] ? `backup-${count}` : "primary";
+                  stored[name] = { key, type: "api_key" };
+                  this.accordion.setSections(this.buildSections());
+                }
+              });
+            }
+          });
+        }
 
         credItems.push({
           id: `delete-provider-${provider}`,
@@ -202,8 +213,14 @@ export class HaUi {
     }
 
     credItems.push({
+      id: "add-provider-info",
+      label: theme.fg("dim", "💡 To add OAuth accounts, run /login in pi"),
+      action: () => {}
+    });
+
+    credItems.push({
       id: "add-provider",
-      label: "+ Add Provider",
+      label: "+ Add API Provider",
       action: () => {
         this.showInput("Provider ID (e.g. anthropic, openai)", "", (pid) => {
           if (pid) {
