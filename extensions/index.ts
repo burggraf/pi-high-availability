@@ -166,6 +166,16 @@ export default function (pi: ExtensionAPI) {
           } else {
               saveConfig(result.config);
               state.activeGroup = result.activeGroup;
+              
+              // Apply any credential switches
+              if (result.changedCreds) {
+                for (const [provider, name] of Object.entries(result.changedCreds)) {
+                  if (switchCred(provider, name as string)) {
+                    ctx.ui.notify(`Activated ${name} for ${provider}`, "info");
+                  }
+                }
+              }
+              
               ctx.ui.notify("HA configuration saved.", "info");
           }
       };

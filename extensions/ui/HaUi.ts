@@ -55,7 +55,8 @@ export class HaUi {
   private accordion: Accordion;
   private onDone: (result: any) => void;
   private ctx: ExtensionContext;
-  
+  private initialActiveCredential: Map<string, string>;
+
   // Input state
   private inputLabel = "";
   private inputValue = "";
@@ -71,6 +72,9 @@ export class HaUi {
     this.activeGroup = activeGroup;
     this.onDone = onDone;
     updateActiveCredentialsFromAuth(this.config);
+
+    // Store initial state so we can detect changes
+    this.initialActiveCredential = new Map(state.activeCredential);
 
     this.accordion = new Accordion(this.buildSections(), ctx.ui.theme, (id) => this.handleAction(id));
   }
@@ -307,7 +311,14 @@ export class HaUi {
       content: new Container(),
       items: [
         { id: "save", label: "💾 Save & Exit", action: () => {
-          this.onDone({ action: "save", config: this.config, activeGroup: this.activeGroup });
+          // Build map of changed credentials (provider -> new active credential name)
+          const changedCreds: Record<string, string> = {};
+          for (const [provider, name] of state.activeCredential.entries()) {
+            if (this.initialActiveCredential.get(provider) !== name) {
+              changedCreds[provider] = name;
+            }
+          }
+          this.onDone({ action: "save", config: this.config, activeGroup: this.activeGroup, changedCreds });
         } },
         { id: "cancel", label: "❌ Cancel", action: () => {
           this.onDone(null);
