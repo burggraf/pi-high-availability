@@ -6,7 +6,7 @@ export interface AccordionSection {
   label: string;
   description?: string;
   content: Component;
-  items?: { id: string; label: string; action: () => void }[];
+  items?: { id: string; label: string; action: () => void; onDelete?: () => void }[];
 }
 
 export class Accordion extends Container {
@@ -104,6 +104,15 @@ export class Accordion extends Container {
         const item = v.section.items![v.itemIndex!];
         item.action();
         this.rebuild(); // Refresh UI in case action changed labels
+      }
+    } else if (matchesKey(data, "x") || matchesKey(data, "d") || matchesKey(data, Key.delete)) {
+      const v = visibleItems[this.selectedIndex];
+      if (v.type === "item") {
+        const item = v.section.items![v.itemIndex!];
+        if (item.onDelete) {
+          item.onDelete();
+          this.rebuild();
+        }
       }
     }
   }

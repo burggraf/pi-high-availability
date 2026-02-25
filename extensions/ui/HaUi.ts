@@ -51,7 +51,7 @@ interface HaConfig {
 export class HaUi {
   private config: HaConfig;
   private activeGroup: string | null = null;
-  private view: "main" | "input" = "main";
+  private view: "main" | "input" | "confirm" = "main";
   private accordion: Accordion;
   private onDone: (result: any) => void;
   private ctx: ExtensionContext;
@@ -60,6 +60,10 @@ export class HaUi {
   private inputLabel = "";
   private inputValue = "";
   private inputCallback: (val: string) => void = () => {};
+
+  // Confirmation state
+  private confirmMessage = "";
+  private confirmCallback: () => void = () => {};
 
   constructor(ctx: ExtensionContext, config: HaConfig, activeGroup: string | null, onDone: (result: any) => void) {
     this.ctx = ctx;
@@ -103,15 +107,12 @@ export class HaUi {
               else delete entry.cooldownMs;
               this.accordion.setSections(this.buildSections());
             });
-          }
-        });
-
-        groupItems.push({
-          id: `delete-entry-${name}-${idx}`,
-          label: `    ${theme.fg("error", "🗑️ Remove " + entry.id.split("/").pop())}`,
-          action: () => {
-            group.entries.splice(idx, 1);
-            this.accordion.setSections(this.buildSections());
+          },
+          onDelete: () => {
+            this.showConfirm(`Remove model '${entry.id}' from group '${name}'?`, () => {
+              group.entries.splice(idx, 1);
+              this.accordion.setSections(this.buildSections());
+            });
           }
         });
       });
@@ -133,10 +134,12 @@ export class HaUi {
         id: `delete-group-${name}`,
         label: `  🗑️ Delete Group ${name}`,
         action: () => {
-          delete this.config.groups[name];
-          if (this.config.defaultGroup === name) delete this.config.defaultGroup;
-          if (this.activeGroup === name) this.activeGroup = null;
-          this.accordion.setSections(this.buildSections());
+          this.showConfirm(`Delete group '${name}' and all its entries?`, () => {
+            delete this.config.groups[name];
+            if (this.config.defaultGroup === name) delete this.config.defaultGroup;
+            if (this.activeGroup === name) this.activeGroup = null;
+            this.accordion.setSections(this.buildSections());
+          });
         }
       });
       groupItems.push({ id: `spacer-group-${name}`, label: "", action: () => {} });
@@ -186,15 +189,12 @@ export class HaUi {
             action: () => {
               state.activeCredential.set(provider, name);
               this.accordion.setSections(this.buildSections());
-            }
-          });
-
-          credItems.push({
-            id: `del-cred-${provider}-${name}`,
-            label: `    ${theme.fg("error", "🗑️ Remove Key: " + name)}`,
-            action: () => {
-              delete this.config.credentials![provider][name];
-              this.accordion.setSections(this.buildSections());
+            },
+            onDelete: () => {
+              this.showConfirm(`Delete key '${name}' for provider '${provider}'?`, () => {
+                delete this.config.credentials![provider][name];
+                this.accordion.setSections(this.buildSections());
+              });
             }
           });
         });
@@ -222,8 +222,10 @@ export class HaUi {
           id: `delete-provider-${provider}`,
           label: `  🗑️ Delete Provider ${provider}`,
           action: () => {
-            delete this.config.credentials![provider];
-            this.accordion.setSections(this.buildSections());
+            this.showConfirm(`Delete provider '${provider}' and all its keys?`, () => {
+              delete this.config.credentials![provider];
+              this.accordion.setSections(this.buildSections());
+            });
           }
         });
         credItems.push({ id: `spacer-provider-${provider}`, label: "", action: () => {} });
@@ -342,6 +344,12 @@ export class HaUi {
     this.inputCallback = callback;
   }
 
+  private showConfirm(message: string, callback: () => void) {
+    this.view = "confirm";
+    this.confirmMessage = message;
+    this.confirmCallback = callback;
+  }
+
   render(width: number): string[] {
     const container = new Container();
     const theme = this.ctx.ui.theme;
@@ -354,12 +362,18 @@ export class HaUi {
       container.addChild(new Text(`> ${this.inputValue}${CURSOR_MARKER}\x1b[7m \x1b[27m`, 1, 0));
       container.addChild(new Spacer(1));
       container.addChild(new Text(theme.fg("dim", " enter confirm • esc cancel "), 1, 0));
+    } else if (this.view === "confirm") {
+      container.addChild(new Text(theme.fg("warning", theme.bold(" Confirmation Needed ")), 1, 0));
+      container.addChild(new Spacer(1));
+      container.addChild(new Text(this.confirmMessage, 1, 0));
+      container.addChild(new Spacer(1));
+      container.addChild(new Text(theme.fg("dim", " y confirm • n/esc cancel "), 1, 0));
     } else {
       container.addChild(new Text(theme.fg("accent", theme.bold(" High Availability Manager ")), 1, 0));
       container.addChild(new Spacer(1));
       container.addChild(this.accordion);
       container.addChild(new Spacer(1));
-      container.addChild(new Text(theme.fg("dim", " ↑↓ navigate • space toggle • enter select • esc exit "), 1, 0));
+      container.addChild(new Text(theme.fg("dim", " ↑↓ navigate • space toggle • enter select • x delete • esc exit "), 1, 0));
     }
 
     container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
@@ -368,7 +382,7 @@ export class HaUi {
 
   handleInput(data: string, tui: any): void {
     if (matchesKey(data, Key.escape)) {
-      if (this.view === "input") {
+      if (this.view === "input" || this.view === "confirm") {
         this.view = "main";
       } else {
         this.onDone(null);
@@ -381,6 +395,13 @@ export class HaUi {
         this.inputValue = this.inputValue.slice(0, -1);
       } else if (data.length === 1 && data.charCodeAt(0) >= 32) {
         this.inputValue += data;
+      }
+    } else if (this.view === "confirm") {
+      if (data.toLowerCase() === "y") {
+        this.confirmCallback();
+        this.view = "main";
+      } else if (data.toLowerCase() === "n") {
+        this.view = "main";
       }
     } else {
       this.accordion.handleInput(data);
