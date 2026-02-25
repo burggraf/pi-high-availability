@@ -105,6 +105,15 @@ export class HaUi {
             });
           }
         });
+
+        groupItems.push({
+          id: `delete-entry-${name}-${idx}`,
+          label: `    ${theme.fg("error", "🗑️ Remove " + entry.id.split("/").pop())}`,
+          action: () => {
+            group.entries.splice(idx, 1);
+            this.accordion.setSections(this.buildSections());
+          }
+        });
       });
       
       groupItems.push({
@@ -176,6 +185,15 @@ export class HaUi {
             label: `  ${status}${name}`,
             action: () => {
               state.activeCredential.set(provider, name);
+              this.accordion.setSections(this.buildSections());
+            }
+          });
+
+          credItems.push({
+            id: `del-cred-${provider}-${name}`,
+            label: `    ${theme.fg("error", "🗑️ Remove Key: " + name)}`,
+            action: () => {
+              delete this.config.credentials![provider][name];
               this.accordion.setSections(this.buildSections());
             }
           });
