@@ -4,15 +4,15 @@
 
 ## ✨ Features
 
-- **Automatic Failover**: Detects quota exhaustion (429 errors) and capacity constraints, then seamlessly switches to backup providers
-- **User-Defined Priority Groups**: Create custom failover chains (e.g., "Pro" → "Fast" → "Cheap")
-- **Multiple OAuth Accounts**: Automatically stores multiple OAuth credentials for the same provider
-- **Smart Error Detection**: Distinguishes between quota errors, rate limits, and capacity constraints
-- **Google Gemini Aware**: Waits for Gemini's internal retries to complete before failing over
-- **Smart Cooldown Management**: Tracks exhaustion per individual credential (e.g., primary vs backup) and per provider, with a configurable 1-hour default.
-- **Failover Chain**: Automatically tries all available credentials for the current provider before switching to the next provider in your priority group.
-- **Automatic Retry**: Resends your last message after switching providers
-- **Loop Prevention**: Ensures each provider is only tried once per message
+- **Unified HA Manager**: A beautiful interactive TUI (`/ha`) to manage all your groups and credentials in one place.
+- **Automatic Multi-Tier Failover**: 
+    1. **Account Failover**: Seamlessly switches between multiple accounts for the *same* provider.
+    2. **Provider Failover**: Automatically jumps to the next provider in your group if all accounts for the current provider are exhausted.
+- **Exhaustion Tracking**: Intelligent cooldown management marks specific accounts or providers as "exhausted" on 429/capacity errors, preventing retries until they recover.
+- **Dynamic Provider Discovery**: Automatically detects all supported Pi providers (Anthropic, OpenAI, Gemini, Moonshot, Zai, etc.) without configuration.
+- **Group Management**: Create custom failover chains (e.g., "Fast Tier" → "Backup Tier") and rearrange model priority with simple keybindings.
+- **Credential Sync & Storage**: Automatically capture OAuth logins or manually add API keys for backup accounts.
+- **Smart Error Detection**: Distinguishes between quota errors and transient capacity issues, including full support for Google Gemini's internal retry patterns.
 
 ## 🚀 Quick Start
 
@@ -22,14 +22,58 @@
 pi install npm:pi-high-availability
 ```
 
-### 2. Create Configuration File
+### 2. Open the Manager
+
+Run the High Availability manager to initialize your configuration:
 
 ```bash
-pi -e pi-high-availability
-# Then run: /ha-init
+/ha
 ```
 
-Or manually create `~/.pi/agent/ha.json`:
+### 3. Configure Your First Group
+
+1.  Select **📂 Groups**.
+2.  Add or select a group (e.g., `default`).
+3.  Add Model IDs (e.g., `anthropic/claude-3-5-sonnet`) to the group.
+4.  Use **`u`** and **`d`** keys to rearrange the priority.
+
+## 🎮 The HA Manager (`/ha`)
+
+The interactive manager is your control center for high availability.
+
+### 📂 Group Management
+*   **Add/Rename/Delete** groups.
+*   **Rearrange Priority**: Use **`u`** (up) and **`d`** (down) keys to set the failover order of models within a group.
+*   **Per-Entry Cooldown**: Set custom recovery times for specific models.
+
+### 🔑 Credential Management
+*   **Sync from auth.json**: Instantly capture any accounts you've logged into via `/login`.
+*   **Add Provider**: Guided setup for **🔑 API Key** or **🌐 OAuth / SSO** providers.
+*   **Account Priority**: Use **`u`** and **`d`** keys to decide which account is `primary` and which are `backup-1`, `backup-2`, etc.
+*   **Activate**: Manually "push" any stored HA credential into Pi's active `auth.json`.
+
+### ⏱️ Settings
+*   **Default Cooldown**: Set the default recovery time (e.g., 3600000ms for 1 hour) for exhausted providers.
+*   **Default Group**: Choose which failover chain Pi uses when it starts up.
+
+## 🔍 How Failover Works
+
+### The Failover Chain
+When a quota or capacity error is detected:
+1.  **Try Next Account**: The extension looks for another credential for the *same* provider (e.g., your second Google account).
+2.  **Mark Exhausted**: The current account is marked as exhausted and won't be used again until its cooldown expires.
+3.  **Switch Provider**: If all accounts for that provider are exhausted, the extension looks at the **Active Group** and switches to the next provider/model in the list.
+4.  **Automatic Retry**: Pi automatically resends your last message using the new provider and primary account, making the transition transparent.
+
+### Error Detection
+The extension detects:
+*   **Quota Errors**: HTTP 429, "rate limit", "insufficient quota", etc.
+*   **Capacity Errors**: "No capacity available", "Engine Overloaded", etc.
+*   **Gemini Awareness**: Correctly waits for Google's internal retry attempts before triggering a failover.
+
+## ⚙️ Configuration Guide (`ha.json`)
+
+While you should use the `/ha` UI, you can also manually edit `~/.pi/agent/ha.json`:
 
 ```json
 {
@@ -38,256 +82,20 @@ Or manually create `~/.pi/agent/ha.json`:
       "name": "Professional Tier",
       "entries": [
         { "id": "anthropic/claude-3-5-sonnet" },
-        { "id": "google-gemini-cli/gemini-1.5-pro" },
-        { "id": "openai/gpt-4o" }
+        { "id": "google-gemini-cli/gemini-1.5-pro", "cooldownMs": 1800000 }
       ]
     }
   },
   "defaultGroup": "pro",
-  "defaultCooldownMs": 3600000
-}
-```
-
-### 3. Use pi Normally
-
-Start coding! If your primary provider hits quota, the extension automatically switches to the next one.
-
-## 📋 Configuration Guide
-
-### Basic Structure
-
-```json
-{
-  "groups": {
-    "<group-name>": {
-      "name": "Display Name",
-      "entries": [
-        { "id": "provider/model-id", "cooldownMs": 3600000 },
-        { "id": "provider" }
-      ]
+  "defaultCooldownMs": 3600000,
+  "credentials": {
+    "anthropic": {
+      "primary": { "type": "oauth", "refresh": "...", "access": "..." },
+      "backup-1": { "type": "api_key", "key": "..." }
     }
-  },
-  "defaultGroup": "<group-name>",
-  "defaultCooldownMs": 3600000
+  }
 }
 ```
-
-### Entry Formats
-
-Entries can be specified in two ways:
-
-1. **Provider + Model** (recommended): `"anthropic/claude-3-5-sonnet"`
-2. **Provider Only**: `"anthropic"` (uses first available model from that provider)
-
-### Per-Entry Cooldown
-
-Override the global cooldown for specific entries:
-
-```json
-{
-  "id": "anthropic/claude-3-5-sonnet",
-  "cooldownMs": 1800000
-}
-```
-
-## 🔐 Multiple OAuth Accounts
-
-The extension automatically stores OAuth credentials in `~/.pi/agent/ha.json` and can switch between them during failover.
-
-### How It Works
-
-When you run `/login` and authenticate with an OAuth provider:
-1. The extension automatically syncs the credential from `auth.json` to `ha.json`
-2. If the credential is new (different from existing ones), it's stored with a unique name
-3. During failover, the extension can switch between these stored credentials
-
-### Adding a Backup OAuth Account
-
-**Scenario**: You have one Google account set up. You want to add a second.
-
-```bash
-# 1. Check current credentials
-/ha-status
-
-# 2. Run /login and authenticate with your second account
-/login
-# (Select Google Cloud Code Assist, login with backup Google account)
-
-# 3. Sync the new credential to ha.json
-/ha-sync
-
-# 4. Verify both credentials are stored
-/ha-status
-```
-
-The output will show:
-```
-OAuth credentials stored:
-  google-gemini-cli: primary, backup-1 (active: primary)
-```
-
-### Manual Credential Switching
-
-To manually switch which OAuth credential is active:
-
-```bash
-/ha-switch google-gemini-cli backup-1
-```
-
-This swaps the credential in `auth.json` so you can test different accounts.
-
-## 🎮 Commands
-
-| Command | Description |
-|---------|-------------|
-| `/ha-init` | Create a default `~/.pi/agent/ha.json` configuration |
-| `/ha-use <group>` | Switch to a different failover group |
-| `/ha-status` | Show active group, exhausted providers, and stored OAuth credentials |
-| `/ha-sync` | Sync OAuth credentials from `auth.json` to `ha.json` |
-| `/ha-switch <provider> <name>` | Manually switch to a specific OAuth credential |
-
-## 🔍 How It Works
-
-### Error Detection
-
-The extension detects two categories of errors:
-
-#### 1. Quota/Rate Limit Errors (trigger immediately)
-- HTTP 429 (Too Many Requests)
-- "quota exceeded"
-- "resource exhausted"
-- "rate limit" / "rate_limit"
-- "exceeded_current_quota"
-- "insufficient quota"
-
-#### 2. Capacity Errors (provider-side resource exhaustion)
-
-| Provider | Error Pattern | Behavior |
-|----------|--------------|----------|
-| **Google Gemini** | `No capacity available` → `Retry failed after N attempts` | **Only triggers on final "Retry failed" message** (Gemini retries internally) |
-| **Anthropic Claude** | `Due to unexpected capacity constraints` | Triggers immediately |
-| **Moonshot** | `Engine Overloaded` | Triggers immediately |
-| **OpenAI/Groq** | `429 Too Many Requests` (capacity-related) | Triggers immediately |
-
-### Failover Flow
-
-1. **Error Detected**: Extension sees a quota/capacity error in the `turn_end` hook
-2. **Try Next OAuth Credential**: If multiple OAuth credentials exist for the provider, switch to the next one
-3. **Mark Exhausted**: If no more OAuth credentials, mark the provider as exhausted
-4. **Find Next Provider**: Scan the group for the next available provider
-5. **Switch**: Calls `pi.setModel()` to change to the new provider
-6. **Notify**: Shows you a message: "⚠️ Quota hit on anthropic! Switching to google..."
-7. **Retry**: Automatically resends your last message using `pi.sendUserMessage()`
-
-### Loop Prevention
-
-- Each provider/OAuth combination is only tried **once per message**
-- Cooldown prevents reusing exhausted providers (default: 1 hour)
-- If all providers and OAuth credentials are exhausted, you get an error message
-
-## 📊 Example Scenarios
-
-### Scenario 1: OAuth Backup Chain
-
-**You**: "Generate unit tests for this function"
-
-**Primary Google Account**: ❌ Error: 429 - Quota exceeded
-
-**Extension**:
-1. Detects multiple OAuth credentials for `google-gemini-cli`
-2. Switches to `backup-1` credential
-3. Retries your message
-
-**Backup Google Account**: ✅ "Here are comprehensive unit tests..."
-
-### Scenario 2: Provider Failover
-
-**You**: "Refactor this authentication module"
-
-**Anthropic**: ❌ Error: 429 - You exceeded your current quota
-
-**Extension**:
-1. No more OAuth credentials for Anthropic
-2. Marks `anthropic/claude-3-5-sonnet` as exhausted
-3. Finds next entry: `google-gemini-cli/gemini-1.5-pro`
-4. Switches model
-5. Retries your message
-
-**Google**: ✅ "Here's the refactored authentication module..."
-
-### Scenario 3: Google Gemini Capacity
-
-**You**: "Explain this regex pattern"
-
-**Gemini**: ⚠️ No capacity available for model gemini-1.5-pro
-
-**Gemini** (internal retry 1): ⚠️ No capacity available...
-
-**Gemini** (internal retry 2): ⚠️ No capacity available...
-
-**Gemini** (final): ❌ Retry failed after 3 attempts
-
-**Extension**:
-1. Waits for final "Retry failed" message
-2. Switches to backup OAuth credential
-3. Retries with backup account
-
-## ⚙️ Advanced Configuration
-
-### Custom Cooldown Periods
-
-```json
-{
-  "groups": {
-    "pro": {
-      "entries": [
-        { "id": "anthropic/claude-3-5-sonnet", "cooldownMs": 3600000 },
-        { "id": "google-gemini-cli/gemini-1.5-pro", "cooldownMs": 1800000 },
-        { "id": "openai/gpt-4o", "cooldownMs": 7200000 }
-      ]
-    }
-  },
-  "defaultCooldownMs": 3600000
-}
-```
-
-### Provider-Only Entries
-
-If you don't care about the specific model:
-
-```json
-{
-  "entries": [
-    { "id": "anthropic" },
-    { "id": "google-gemini-cli" },
-    { "id": "openai" }
-  ]
-}
-```
-
-The extension will use the first available model from each provider.
-
-## 🐛 Troubleshooting
-
-### Extension not loading
-- Check that `~/.pi/agent/ha.json` exists
-- Verify the JSON syntax is valid: `cat ~/.pi/agent/ha.json | python -m json.tool`
-- Check pi's extension loading logs
-
-### Failover not triggering
-- Run `/ha-status` to see current state
-- Check if error message matches known patterns (see Error Detection section)
-- Verify you have authentication for fallback providers
-
-### OAuth credentials not syncing
-- Run `/ha-sync` manually after `/login`
-- Check that `~/.pi/agent/ha.json` has an `oauth` section
-- Verify credentials are different (different refresh tokens)
-
-### All providers exhausted
-- Wait for cooldown period to expire (default: 1 hour)
-- Restart pi to reset in-memory cooldowns
-- Add more providers or OAuth credentials to your group
 
 ## 📄 License
 
