@@ -2,6 +2,16 @@
 
 **pi-high-availability** automatically switches to fallback LLM providers when your primary provider hits quota limits or capacity constraints. Never get stuck waiting for quota resets again.
 
+## 🆕 What's New in v2.1.0
+
+**Configurable Error Handling** — You can now control how the extension responds to different types of errors:
+
+- **Capacity Errors** (e.g., "out of capacity", "engine overloaded"): These affect all accounts for a provider equally, so switching accounts doesn't help. Now you can choose to `stop`, `retry` after a timeout, or jump to `next_provider`.
+  
+- **Quota Errors** (e.g., "rate limit exceeded", "insufficient quota"): These are per-account, so switching to another OAuth key or API key may solve the problem. Choose from `stop`, `retry`, `next_provider`, or `next_key_then_provider` (default).
+
+Configure these in `/ha` under **⚙️ Settings** or directly in `ha.json` (see [Error Handling Configuration](#error-handling-configuration)).
+
 ## ✨ Features
 
 - **Unified HA Manager**: A beautiful interactive TUI (`/ha`) with accordion-style navigation to manage all your groups and credentials in one place.
@@ -70,6 +80,10 @@ The interactive manager is your control center for high availability.
 ### ⏱️ Settings
 *   **Default Cooldown**: Set the default recovery time (e.g., 3600000ms for 1 hour) for exhausted providers.
 *   **Default Group**: Choose which failover chain Pi uses when it starts up.
+*   **Error Handling**: Configure how different error types are handled:
+    *   **Capacity Error Action**: What to do when a provider reports "out of capacity" (doesn't help to switch accounts for the same provider)
+    *   **Quota Error Action**: What to do when a provider reports quota/rate limit exceeded (switching accounts may help)
+    *   **Retry Timeout**: How long to wait before retrying when using "retry" action (default: 300000ms = 5 minutes)
 
 ## 🔍 How Failover Works
 
@@ -103,6 +117,11 @@ While you should use the `/ha` UI, you can also manually edit `~/.pi/agent/ha.js
   },
   "defaultGroup": "pro",
   "defaultCooldownMs": 3600000,
+  "errorHandling": {
+    "capacityErrorAction": "next_provider",
+    "quotaErrorAction": "next_key_then_provider",
+    "retryTimeoutMs": 300000
+  },
   "credentials": {
     "anthropic": {
       "primary": { "type": "oauth", "refresh": "...", "access": "..." },
@@ -111,6 +130,45 @@ While you should use the `/ha` UI, you can also manually edit `~/.pi/agent/ha.js
   }
 }
 ```
+
+### Error Handling Configuration
+
+The `errorHandling` section in `ha.json` lets you customize how the extension responds to different error types:
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| `capacityErrorAction` | Action when provider has no capacity (affects all accounts) | `next_key_then_provider` |
+| `quotaErrorAction` | Action when account hits rate limit (may not affect other accounts) | `next_key_then_provider` |
+| `retryTimeoutMs` | How long to wait before retrying (in milliseconds) | `300000` (5 minutes) |
+
+#### Understanding the Error Types
+
+**Capacity Errors** occur when a provider's servers are overloaded. Examples:
+- "No capacity available for this model"
+- "Engine overloaded"
+- "Service temporarily unavailable"
+
+These errors affect the provider's infrastructure, so switching to a different account for the same provider typically won't help. Recommended action: `next_provider` or `retry`.
+
+**Quota Errors** occur when an account exceeds its limits. Examples:
+- "Rate limit exceeded (429)"
+- "Insufficient quota"
+- "Daily limit reached"
+
+These errors are per-account, so switching to another OAuth entry or API key for the same provider may solve the problem. Recommended action: `next_key_then_provider` (default) or `next_provider` if you don't have backup accounts.
+
+#### Available Actions
+
+The following actions can be configured for both `capacityErrorAction` and `quotaErrorAction`:
+
+| Action | Description |
+|--------|-------------|
+| `stop` | Stop the process and display the error (default if pi-high-availability is not installed) |
+| `retry` | Wait for `retryTimeoutMs` milliseconds, then retry the same request |
+| `next_provider` | Immediately switch to the next provider in the current group |
+| `next_key_then_provider` | Try the next account/key for the current provider, then move to next provider if all exhausted (default) |
+
+**Note:** For capacity errors, `next_key_then_provider` is often not helpful since all accounts for the same provider typically share the same capacity pool. Use `next_provider` or `retry` for capacity errors instead.
 
 ## 📄 License
 

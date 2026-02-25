@@ -20,7 +20,7 @@ function loadAuthJson() {
 function updateActiveCredentialsFromAuth(config: HaConfig) {
   if (!config?.credentials) return;
   const auth = loadAuthJson();
-  
+
   for (const [providerId, currentAuth] of Object.entries(auth)) {
     const stored = config.credentials[providerId];
     if (!stored) continue;
@@ -39,6 +39,8 @@ function updateActiveCredentialsFromAuth(config: HaConfig) {
   }
 }
 
+type ErrorAction = "stop" | "retry" | "next_provider" | "next_key_then_provider";
+
 interface HaGroupEntry { id: string; cooldownMs?: number; }
 interface HaGroup { name: string; entries: HaGroupEntry[]; }
 interface HaConfig {
@@ -46,6 +48,11 @@ interface HaConfig {
   defaultGroup?: string;
   defaultCooldownMs?: number;
   credentials?: Record<string, Record<string, any>>;
+  errorHandling?: {
+    capacityErrorAction?: ErrorAction;
+    quotaErrorAction?: ErrorAction;
+    retryTimeoutMs?: number;
+  };
 }
 
 export class HaUi {
@@ -89,7 +96,7 @@ export class HaUi {
       const isDefault = name === this.config.defaultGroup;
       const isActive = name === this.activeGroup;
       const status = (isActive ? "● " : "○ ") + (isDefault ? "🎯 " : "");
-      
+
       groupItems.push({
         id: `group-${name}`,
         label: `${status}${name} (${group.entries.length} models)`,
@@ -98,7 +105,7 @@ export class HaUi {
           this.accordion.setSections(this.buildSections());
         }
       });
-      
+
       group.entries.forEach((entry, idx) => {
         const cooldown = entry.cooldownMs ? ` [${entry.cooldownMs}ms]` : "";
         groupItems.push({
@@ -120,7 +127,7 @@ export class HaUi {
           }
         });
       });
-      
+
       groupItems.push({
         id: `add-model-${name}`,
         label: `  + Add Model to ${name}`,
@@ -166,7 +173,7 @@ export class HaUi {
       id: "groups",
       label: "📂 Groups",
       description: `${Object.keys(this.config.groups).length} configured`,
-      content: new Container(), 
+      content: new Container(),
       items: groupItems
     });
 
@@ -176,10 +183,10 @@ export class HaUi {
       Object.entries(this.config.credentials).forEach(([provider, creds]) => {
         // Detect if this provider is an OAuth provider (has entries with refresh tokens)
         const isOAuth = Object.values(creds).some(c => c && typeof c === 'object' && 'refresh' in c);
-        
-        credItems.push({ 
-          id: `provider-${provider}`, 
-          label: `🔌 ${provider}${isOAuth ? " (OAuth)" : ""}`, 
+
+        credItems.push({
+          id: `provider-${provider}`,
+          label: `🔌 ${provider}${isOAuth ? " (OAuth)" : ""}`,
           action: () => {},
           onDelete: () => {
             this.showConfirm(`Delete provider '${provider}' and all its keys?`, () => {
@@ -188,7 +195,7 @@ export class HaUi {
             });
           }
         });
-        
+
         Object.entries(creds).forEach(([name, cred]) => {
           if (name === "type") return;
           const isActive = state.activeCredential.get(provider) === name;
@@ -269,7 +276,9 @@ export class HaUi {
       items: credItems
     });
 
-    // --- Settings Section ---
+    // --- Settings Section ---    
+    const errorHandling = this.config.errorHandling || {};
+    
     const settingsItems = [
       {
         id: "set-default-group",
@@ -291,6 +300,44 @@ export class HaUi {
           this.showInput("Default Cooldown", (this.config.defaultCooldownMs || 0).toString(), (val) => {
             const num = parseInt(val);
             if (!isNaN(num)) this.config.defaultCooldownMs = num;
+            this.accordion.setSections(this.buildSections());
+          });
+        }
+      },
+      {
+        id: "set-capacity-action",
+        label: `🔥 Capacity Error: ${errorHandling.capacityErrorAction || "next_key_then_provider"}`,
+        action: () => {
+          const actions: ErrorAction[] = ["stop", "retry", "next_provider", "next_key_then_provider"];
+          const current = errorHandling.capacityErrorAction || "next_key_then_provider";
+          const nextIdx = (actions.indexOf(current) + 1) % actions.length;
+          if (!this.config.errorHandling) this.config.errorHandling = {};
+          this.config.errorHandling.capacityErrorAction = actions[nextIdx];
+          this.accordion.setSections(this.buildSections());
+        }
+      },
+      {
+        id: "set-quota-action",
+        label: `📊 Quota Error: ${errorHandling.quotaErrorAction || "next_key_then_provider"}`,
+        action: () => {
+          const actions: ErrorAction[] = ["stop", "retry", "next_provider", "next_key_then_provider"];
+          const current = errorHandling.quotaErrorAction || "next_key_then_provider";
+          const nextIdx = (actions.indexOf(current) + 1) % actions.length;
+          if (!this.config.errorHandling) this.config.errorHandling = {};
+          this.config.errorHandling.quotaErrorAction = actions[nextIdx];
+          this.accordion.setSections(this.buildSections());
+        }
+      },
+      {
+        id: "set-retry-timeout",
+        label: `⏲️ Retry Timeout: ${errorHandling.retryTimeoutMs || 300000}ms`,
+        action: () => {
+          this.showInput("Retry Timeout (ms)", (errorHandling.retryTimeoutMs || 300000).toString(), (val) => {
+            const num = parseInt(val);
+            if (!isNaN(num)) {
+              if (!this.config.errorHandling) this.config.errorHandling = {};
+              this.config.errorHandling.retryTimeoutMs = num;
+            }
             this.accordion.setSections(this.buildSections());
           });
         }
@@ -360,9 +407,9 @@ export class HaUi {
   render(width: number): string[] {
     const container = new Container();
     const theme = this.ctx.ui.theme;
-    
+
     container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-    
+
     if (this.view === "input") {
       container.addChild(new Text(theme.fg("accent", theme.bold(` ${this.inputLabel} `)), 1, 0));
       container.addChild(new Spacer(1));

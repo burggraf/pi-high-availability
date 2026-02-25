@@ -9,6 +9,8 @@ import { join } from "path";
 import { homedir } from "os";
 import { HaUi } from "./ui/HaUi";
 
+type ErrorAction = "stop" | "retry" | "next_provider" | "next_key_then_provider";
+
 interface HaGroupEntry { id: string; cooldownMs?: number; }
 interface HaGroup { name: string; entries: HaGroupEntry[]; }
 interface HaConfig {
@@ -16,6 +18,11 @@ interface HaConfig {
   defaultGroup?: string;
   defaultCooldownMs?: number;
   credentials?: Record<string, Record<string, any>>;
+  errorHandling?: {
+    capacityErrorAction?: ErrorAction;
+    quotaErrorAction?: ErrorAction;
+    retryTimeoutMs?: number;
+  };
 }
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
@@ -27,6 +34,7 @@ const state = {
   exhausted: new Map<string, { exhaustedAt: number, cooldownMs: number }>(),
   isRetrying: false,
   activeCredential: new Map<string, string>(),
+  retryTimeoutId: null as NodeJS.Timeout | null,
 };
 
 let config: HaConfig | null = null;
@@ -83,8 +91,8 @@ function switchCred(providerId: string, name: string) {
   if (!config?.credentials?.[providerId]?.[name]) return false;
   const auth = loadAuthJson();
   
-  // Clone the stored credential but exclude the HA-specific 'type' field 
-  // if you want auth.json to remain pristine, although pi handles extra fields fine.
+  
+  
   const credToSave = JSON.parse(JSON.stringify(config.credentials[providerId][name]));
   
   auth[providerId] = credToSave;
@@ -103,7 +111,7 @@ function updateActiveCredentialsFromAuth() {
 
     for (const [name, cred] of Object.entries(stored)) {
       if (name === "type") continue;
-      // Match by key or refresh token
+      
       if ((currentAuth as any).key && (currentAuth as any).key === (cred as any).key) {
         state.activeCredential.set(providerId, name);
         break;
@@ -132,7 +140,7 @@ export default function (pi: ExtensionAPI) {
         saveConfig(config);
       }
       
-      syncAuthToHa(); // Ensure we are up-to-date with auth.json on open
+      syncAuthToHa(); 
 
       const loop = async () => {
           const result = await ctx.ui.custom<any | null>(
@@ -167,7 +175,7 @@ export default function (pi: ExtensionAPI) {
               saveConfig(result.config);
               state.activeGroup = result.activeGroup;
               
-              // Apply any credential switches
+              
               if (result.changedCreds) {
                 for (const [provider, name] of Object.entries(result.changedCreds)) {
                   if (switchCred(provider, name as string)) {
@@ -241,12 +249,23 @@ export default function (pi: ExtensionAPI) {
     const msg = event.message;
     if (msg?.role !== "assistant") return;
 
-    const isError = msg.errorMessage && (
-      msg.errorMessage.includes("429") || 
-      msg.errorMessage.toLowerCase().includes("quota") || 
-      msg.errorMessage.toLowerCase().includes("capacity")
-    );
-    if (!isError) return;
+    // Determine error type
+    const errorMsg = msg.errorMessage || "";
+    const errorLower = errorMsg.toLowerCase();
+    
+    // Capacity errors: no capacity, engine overloaded, etc.
+    const isCapacityError = errorLower.includes("capacity") || 
+                            errorLower.includes("no capacity") ||
+                            errorLower.includes("engine overloaded") ||
+                            errorLower.includes("overloaded");
+    
+    // Quota errors: rate limits, insufficient quota, etc.
+    const isQuotaError = errorMsg.includes("429") || 
+                         errorLower.includes("quota") || 
+                         errorLower.includes("rate limit") ||
+                         errorLower.includes("insufficient quota");
+    
+    if (!isCapacityError && !isQuotaError) return;
 
     const providerId = ctx.model?.provider;
     if (!providerId) return;
@@ -254,70 +273,107 @@ export default function (pi: ExtensionAPI) {
     const group = config.groups[state.activeGroup];
     if (!group) return;
 
-    // 1. Try to rotate credentials for the CURRENT provider first
-    const stored = config.credentials?.[providerId];
-    if (stored) {
-      const names = Object.keys(stored).filter(k => k !== "type");
-      const currentCred = state.activeCredential.get(providerId) || "primary";
-      
-      // Mark current cred as exhausted
-      const cooldown = config.defaultCooldownMs || 3600000;
-      state.exhausted.set(`${providerId}:${currentCred}`, { exhaustedAt: Date.now(), cooldownMs: cooldown });
+    // Get error handling configuration
+    const errorHandling = config.errorHandling || {};
+    const action: ErrorAction = isCapacityError 
+      ? (errorHandling.capacityErrorAction || "next_key_then_provider")
+      : (errorHandling.quotaErrorAction || "next_key_then_provider");
+    
+    const retryTimeoutMs = errorHandling.retryTimeoutMs || 300000; // Default 5 minutes
 
-      // Find next non-exhausted credential
-      for (let i = 1; i <= names.length; i++) {
-        const nextIdx = (names.indexOf(currentCred) + i) % names.length;
-        const nextName = names[nextIdx];
+    // Handle "stop" action
+    if (action === "stop") {
+      ctx.ui.notify(`🛑 ${isCapacityError ? "Capacity" : "Quota"} error. Stopping as configured.`, "error");
+      return;
+    }
+
+    // Handle "retry" action
+    if (action === "retry") {
+      if (state.retryTimeoutId) {
+        clearTimeout(state.retryTimeoutId);
+      }
+      ctx.ui.notify(`⏱️ ${isCapacityError ? "Capacity" : "Quota"} error. Retrying in ${retryTimeoutMs}ms...`, "warning");
+      state.retryTimeoutId = setTimeout(() => {
+        retryTurn(ctx);
+      }, retryTimeoutMs);
+      return;
+    }
+
+    // Determine what to try based on action
+    const shouldTryNextKey = action === "next_key_then_provider";
+    const shouldTryNextProvider = action === "next_provider" || action === "next_key_then_provider";
+
+    // Try next key/account for the same provider
+    if (shouldTryNextKey) {
+      const stored = config.credentials?.[providerId];
+      if (stored) {
+        const names = Object.keys(stored).filter(k => k !== "type");
+        const currentCred = state.activeCredential.get(providerId) || "primary";
         
-        const exhaustState = state.exhausted.get(`${providerId}:${nextName}`);
-        const isStillExhausted = exhaustState && (Date.now() - exhaustState.exhaustedAt < exhaustState.cooldownMs);
-        
-        if (!isStillExhausted) {
-          if (switchCred(providerId, nextName)) {
-            ctx.ui.notify(`⚠️ Quota hit. Switching ${providerId} account to ${nextName}...`, "warning");
-            retryTurn(ctx);
-            return;
+        // Mark current credential as exhausted
+        const cooldown = config.defaultCooldownMs || 3600000;
+        state.exhausted.set(`${providerId}:${currentCred}`, { exhaustedAt: Date.now(), cooldownMs: cooldown });
+
+        // Try to find next available credential
+        for (let i = 1; i <= names.length; i++) {
+          const nextIdx = (names.indexOf(currentCred) + i) % names.length;
+          const nextName = names[nextIdx];
+          
+          const exhaustState = state.exhausted.get(`${providerId}:${nextName}`);
+          const isStillExhausted = exhaustState && (Date.now() - exhaustState.exhaustedAt < exhaustState.cooldownMs);
+          
+          if (!isStillExhausted) {
+            if (switchCred(providerId, nextName)) {
+              ctx.ui.notify(`⚠️ ${isCapacityError ? "Capacity" : "Quota"} error. Switching ${providerId} account to ${nextName}...`, "warning");
+              retryTurn(ctx);
+              return;
+            }
           }
         }
       }
     }
 
-    // 2. If all credentials for current provider fail, switch to NEXT provider in the group
-    const currentModelId = `${ctx.model?.provider}/${ctx.model?.id}`;
-    const entries = group.entries;
-    
-    // Note: User's ha.json has provider IDs as entries. We should support both provider IDs and full model IDs.
-    const findEntryIndex = () => {
-        const idx = entries.findIndex(e => e.id === currentModelId || e.id === providerId);
-        return idx;
-    };
+    // Try next provider in the group
+    if (shouldTryNextProvider) {
+      const currentModelId = `${ctx.model?.provider}/${ctx.model?.id}`;
+      const entries = group.entries;
+      
+      
+      const findEntryIndex = () => {
+          const idx = entries.findIndex(e => e.id === currentModelId || e.id === providerId);
+          return idx;
+      };
 
-    const currentEntryIdx = findEntryIndex();
-    for (let i = 1; i <= entries.length; i++) {
-        const nextEntryIdx = (currentEntryIdx + i) % entries.length;
-        const nextEntry = entries[nextEntryIdx];
-        
-        // If it's just a provider name, we try to find a model for it
-        let targetModel = ctx.modelRegistry.find(nextEntry.id, ""); // Placeholder
-        if (!targetModel) {
-            // Try to find ANY available model for this provider
-            const allModels = ctx.modelRegistry.getAll();
-            targetModel = allModels.find(m => m.provider === nextEntry.id || `${m.provider}/${m.id}` === nextEntry.id);
-        }
+      const currentEntryIdx = findEntryIndex();
+      for (let i = 1; i <= entries.length; i++) {
+          const nextEntryIdx = (currentEntryIdx + i) % entries.length;
+          const nextEntry = entries[nextEntryIdx];
+          
+          
+          let targetModel = ctx.modelRegistry.find(nextEntry.id, ""); 
+          if (!targetModel) {
+              
+              const allModels = ctx.modelRegistry.getAll();
+              targetModel = allModels.find(m => m.provider === nextEntry.id || `${m.provider}/${m.id}` === nextEntry.id);
+          }
 
-        if (targetModel) {
-            const nextProviderId = targetModel.provider;
-            
-            // Switch to primary cred for the new provider
-            switchCred(nextProviderId, "primary");
-            
-            if (await pi.setModel(targetModel)) {
-                ctx.ui.notify(`🚨 All ${providerId} accounts exhausted. Failing over to ${nextProviderId}...`, "error");
-                retryTurn(ctx);
-                return;
-            }
-        }
+          if (targetModel) {
+              const nextProviderId = targetModel.provider;
+              
+              
+              switchCred(nextProviderId, "primary");
+              
+              if (await pi.setModel(targetModel)) {
+                  ctx.ui.notify(`🚨 All ${providerId} accounts exhausted. Failing over to ${nextProviderId}...`, "error");
+                  retryTurn(ctx);
+                  return;
+              }
+          }
+      }
     }
+
+    // No fallback options worked
+    ctx.ui.notify(`❌ ${isCapacityError ? "Capacity" : "Quota"} error. No fallback options available.`, "error");
   });
 
   function retryTurn(ctx: any) {

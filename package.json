@@ -1,6 +1,6 @@
 {
   "name": "pi-high-availability",
-  "version": "2.0.1",
+  "version": "2.1.0",
   "description": "High Availability extension for pi - automatic failover when quota or capacity is exhausted",
   "repository": {
     "type": "git",
