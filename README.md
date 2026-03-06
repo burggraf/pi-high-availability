@@ -2,7 +2,35 @@
 
 **pi-high-availability** automatically switches to fallback LLM providers when your primary provider hits quota limits or capacity constraints. Never get stuck waiting for quota resets again.
 
-## 🆕 What's New in v2.1.0
+## 🆕 What's New in v2.2.0
+
+---
+
+**Per-Session Group Selection** — You can now specify which HA group to use for a `--ha-group` CLI flag. This is useful when running multiple pi instances with different failover chains.
+
+### Usage
+
+```bash
+# Use default group (from ha.json defaultGroup)
+pi -e .pi/extensions/gastown-hooks.js
+
+# Use specific group via --ha-group
+pi -e .pi/extensions/gastown-hooks.js --ha-group paid --model openai-codex/gpt-5.3-codex
+```
+
+This allows you to configure different gastown workers to use different HA groups based on their role.
+
+### How It works
+
+When pi starts with `--ha-group paid`:
+1. Extension reads the flag value (`paid`)
+2. Validates the group exists in `ha.json`
+3. Sets `state.activeGroup = "paid"`
+4. All failover events use models from the "paid" group
+
+When pi starts without `--ha-group`:
+1. Falls back to `defaultGroup` from `ha.json`
+2. All failover events use models from that group
 
 **Configurable Error Handling** — You can now control how the extension responds to different types of errors:
 
