@@ -213,7 +213,27 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("ha-mock-error", {
-    handler: async () => { pi.sendUserMessage("MOCK_FAILOVER_TRIGGER", { deliverAs: "steer" }); }
+    description: "Mock a quota error to test credential failover",
+    handler: async (_, ctx) => {
+      const providerId = ctx.model?.provider;
+      if (!providerId || !config?.credentials?.[providerId]) {
+        ctx.ui.notify("No credentials configured for current provider.", "error");
+        return;
+      }
+      const stored = config.credentials[providerId];
+      const names = Object.keys(stored);
+      const current = state.activeCredential.get(providerId) || names[0];
+      const next = names[(names.indexOf(current) + 1) % names.length];
+      if (next === current) {
+        ctx.ui.notify("Only one credential — nothing to switch to.", "warning");
+        return;
+      }
+      if (switchCred(providerId, next)) {
+        ctx.ui.notify(`⚠️ MOCK FAILOVER: Switched ${providerId} from ${current} → ${next}`, "warning");
+      } else {
+        ctx.ui.notify(`Failed to switch to ${next}`, "error");
+      }
+    }
   });
 
   pi.on("turn_start", async (event, ctx) => {
