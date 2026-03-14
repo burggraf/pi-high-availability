@@ -8,6 +8,7 @@ import { readFileSync, existsSync, writeFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { HaUi } from "./ui/HaUi";
+import { credValueMatches } from "./secrets";
 
 type ErrorAction = "stop" | "retry" | "next_provider" | "next_key_then_provider";
 
@@ -66,8 +67,8 @@ function syncAuthToHa() {
     let foundName = null;
     for (const [name, existing] of Object.entries(stored)) {
       if (name === "type") continue;
-      if ((creds as any).refresh && (creds as any).refresh === existing.refresh) { foundName = name; break; }
-      if ((creds as any).key && (creds as any).key === existing.key) { foundName = name; break; }
+      if ((creds as any).refresh && credValueMatches(existing.refresh, (creds as any).refresh)) { foundName = name; break; }
+      if ((creds as any).key && credValueMatches(existing.key, (creds as any).key)) { foundName = name; break; }
     }
 
     if (!foundName) {
@@ -112,11 +113,11 @@ function updateActiveCredentialsFromAuth() {
     for (const [name, cred] of Object.entries(stored)) {
       if (name === "type") continue;
       
-      if ((currentAuth as any).key && (currentAuth as any).key === (cred as any).key) {
+      if ((currentAuth as any).key && credValueMatches((cred as any).key, (currentAuth as any).key)) {
         state.activeCredential.set(providerId, name);
         break;
       }
-      if ((currentAuth as any).refresh && (currentAuth as any).refresh === (cred as any).refresh) {
+      if ((currentAuth as any).refresh && credValueMatches((cred as any).refresh, (currentAuth as any).refresh)) {
         state.activeCredential.set(providerId, name);
         break;
       }

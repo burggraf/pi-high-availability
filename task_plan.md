@@ -1,91 +1,43 @@
-# Task Plan: High Availability Extension for Pi
+# Task Plan: Pi High Availability Extension
 
-## Goal
-Create a High Availability extension for pi that automatically switches to a fallback model/provider when a quota is hit, using user-defined priority groups in `~/.pi/ha.json`, and automatically resends the last message once per provider.
+## PRs
 
-## Current Phase
-Phase 1: Requirements & Discovery
+### PR 1: Fix ha-mock-error (`fix/ha-mock-error`)
+- **Branch**: `fix/ha-mock-error` (from `main`)
+- **Status**: committed, ready to push
+- **Changes**: `extensions/index.ts` — rewrite `ha-mock-error` to directly call `switchCred` instead of sending a message to the model
+- **Why**: Old version sent `MOCK_FAILOVER_TRIGGER` as a user message that reached the model; `turn_start` can't cancel in-flight turns
 
-## Phases
+### PR 2: Pass entry discovery UI (`feat/pass-discovery`)
+- **Branch**: `feat/pass-discovery` (from `fix/ha-mock-error`)
+- **Depends on**: PR 1
+- **Status**: committed, ready to push
+- **Changes**:
+  - `extensions/secrets.ts` — new file: `resolveSecret`, `credValueMatches`, `findPassEntries`
+  - `extensions/index.ts` — use `credValueMatches` in `syncAuthToHa` + `updateActiveCredentialsFromAuth` for mixed resolved/`!pass` comparison
+  - `extensions/ui/HaUi.ts` — pass entry one-click discovery, `credValueMatches` in UI state, masked API key input, `!pass` hint
+- **Why**: Supports `!pass` references in credentials; surfaces matching password store entries in the UI
 
-### Phase 1: Requirements & Discovery
-- [x] Understand user intent (Informed Retry, User-defined Groups, informed notifications)
-- [x] Identify constraints and requirements (Auth integration, 429 detection, cooldowns)
-- [x] Document findings in findings.md
-- **Status:** complete
+### PR 3: Per-entry model+params (`feat/entry-model-params`)
+- **Branch**: `feat/entry-model-params` (from `feat/pass-discovery`)
+- **Depends on**: PR 2
+- **Status**: planned
+- **Changes**:
+  - Extend `HaGroupEntry` with `model?`, `thinkingLevel?`, `temperature?`
+  - Apply model params when failing over via `pi.setModel`
+  - Update UI to configure per-entry model settings
+- **Why**: Allows caste-based groups (scout/worker/soldier) to specify different models and params per provider entry
 
-### Phase 2: Planning & Structure
-- [x] Define `ha.json` schema
-- [x] Define extension architecture (hooks, state management, custom provider registration)
-- [x] Create project structure
-- **Status:** complete
+## Testing Checklist
+- [x] `/ha-mock-error` switches credential (PR1)
+- [x] `/ha-status` shows correct active credential
+- [x] `!pass` refs written to auth.json as-is (pi resolves at API call time)
+- [ ] `findPassEntries` surfaces matching pass paths in UI (PR2)
+- [ ] Per-entry model override applied on failover (PR3)
+- [ ] Cross-provider failover: openrouter → chutes → anthropic
+- [ ] Cooldown behavior across credentials and providers
 
-### Architecture Decisions
-- **Custom Provider Registration**: Use `pi.registerProvider()` to create backup OAuth identities (e.g., `ha-gemini-backup-1`)
-- **OAuth Isolation**: Each backup account gets its own `/login` command and credential storage
-- **Model Mirroring**: Dynamically clone model definitions from original providers to custom providers
-
-### Phase 3: Implementation
-- [x] Create extension directory structure
-- [x] Implement `ha.json` loader and group management
-- [x] Implement custom provider registration for backup OAuth accounts
-- [x] Implement `/ha-use` command
-- [x] Implement `/ha-status` command
-- [x] Implement `turn_end` hook for error detection
-- [x] Implement switching logic (cooldowns, cycling)
-- [x] Implement retry logic (notification + switch + resend)
-- [x] Implement capacity error detection
-- [x] Add Google Gemini-specific "Retry failed" logic
-- **Status:** complete
-
-### Files Created
-- `~/.pi/agent/extensions/ha-provider/index.ts` - Main extension code
-- `~/.pi/agent/extensions/ha-provider/ha.json.example` - Example configuration
-- `~/.pi/agent/extensions/ha-provider/README.md` - Documentation
-- `~/.pi/agent/extensions/ha-provider/package.json` - Package manifest
-- `~/.pi/agent/extensions/ha-provider/tsconfig.json` - TypeScript config
-
-### Phase 4: Testing & Verification
-- [ ] Verify group switching
-- [ ] Verify error detection (mock 429)
-- [ ] Verify failover and resend
-- [ ] Verify cooldown behavior
-- **Status:** pending
-
-### Phase 5: Delivery
-- [x] Final code review
-- [x] Create README for the extension
-- [x] Set up GitHub repository
-- [x] Push to GitHub
-- **Status:** complete
-
-### Deliverables
-- GitHub Repository: https://github.com/burggraf/pi-high-availability
-- NPM Package: `pi-high-availability` (ready to publish)
-- Files:
-  - `extensions/index.ts` - Main extension code
-  - `package.json` - Package manifest with pi configuration
-  - `README.md` - Comprehensive documentation
-  - `.gitignore` - Git ignore file
-
-## Key Questions
-1. How to reliably detect a "quota exceeded" error across all providers? (Research suggests 429/Resource Exhausted)
-2. How to trigger a resend from an extension? (Use `pi.sendUserMessage`)
-3. How to persist "exhausted" state across sessions if needed? (Start with in-memory, maybe move to file)
-
-## Decisions Made
-| Decision | Rationale |
-|----------|-----------|
-| Use `~/.pi/ha.json` | Persistent, user-controllable configuration |
-| Hook into `turn_end` | Allows inspecting the assistant's message for error codes/messages |
-| Use `pi.setModel` | Built-in way to change the active model and resolve auth |
-| Cooldown default 1h | Balance between trying again and avoiding repeated failures |
-
-## Errors Encountered
-| Error | Attempt | Resolution |
-|-------|---------|------------|
-|       | 1       |            |
-
-## Notes
-- Ensure `ha.json` is optional or has sensible defaults
-- Notifications should be clear but not intrusive
+## Architecture Notes
+- auth.json should contain `!pass` refs, not resolved values — pi resolves at API call time
+- `credValueMatches` handles mixed case (one side resolved, one side `!pass` ref)
+- `updateActiveCredentialsFromAuth` is duplicated in index.ts and HaUi.ts — deduplicate in PR2 or future cleanup

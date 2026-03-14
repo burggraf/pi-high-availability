@@ -4,6 +4,7 @@ import { readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
 import { Accordion, AccordionSection } from "./Accordion";
+import { credValueMatches, findPassEntries } from "../secrets";
 
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const AUTH_PATH = join(AGENT_DIR, "auth.json");
@@ -27,11 +28,11 @@ function updateActiveCredentialsFromAuth(config: HaConfig) {
 
     for (const [name, cred] of Object.entries(stored)) {
       if (name === "type") continue;
-      if ((currentAuth as any).key && (currentAuth as any).key === (cred as any).key) {
+      if ((currentAuth as any).key && credValueMatches((cred as any).key, (currentAuth as any).key)) {
         state.activeCredential.set(providerId, name);
         break;
       }
-      if ((currentAuth as any).refresh && (currentAuth as any).refresh === (cred as any).refresh) {
+      if ((currentAuth as any).refresh && credValueMatches((cred as any).refresh, (currentAuth as any).refresh)) {
         state.activeCredential.set(providerId, name);
         break;
       }
@@ -67,6 +68,7 @@ export class HaUi {
   // Input state
   private inputLabel = "";
   private inputValue = "";
+  private inputMasked = false;
   private inputCallback: (val: string) => void = () => {};
 
   // Confirmation state
@@ -218,11 +220,31 @@ export class HaUi {
 
         // Only show "Add Key" for non-OAuth providers
         if (!isOAuth) {
+          // Surface matching pass entries as one-click options
+          const passEntries = findPassEntries(provider);
+          for (const passPath of passEntries) {
+            const ref = `!pass show ${passPath}`;
+            const alreadyAdded = Object.values(creds).some((c: any) => c.key === ref);
+            if (!alreadyAdded) {
+              credItems.push({
+                id: `pass-${provider}-${passPath}`,
+                label: `  🔑 Use: ${passPath}`,
+                action: () => {
+                  const stored = this.config.credentials![provider];
+                  const count = Object.keys(stored).filter(k => k !== "type").length;
+                  const name = stored["primary"] ? `backup-${count}` : "primary";
+                  stored[name] = { key: ref, type: "api_key" };
+                  this.accordion.setSections(this.buildSections());
+                },
+              });
+            }
+          }
+
           credItems.push({
             id: `add-key-${provider}`,
             label: `  + Add API Key to ${provider}`,
             action: () => {
-              this.showInput("API Key", "", (key) => {
+              this.showInput("API Key or !pass reference", "", (key) => {
                 if (key) {
                   const stored = this.config.credentials![provider];
                   const count = Object.keys(stored).filter(k => k !== "type").length;
@@ -230,7 +252,7 @@ export class HaUi {
                   stored[name] = { key, type: "api_key" };
                   this.accordion.setSections(this.buildSections());
                 }
-              });
+              }, true);
             }
           });
         }
@@ -391,10 +413,11 @@ export class HaUi {
     // No-op for now
   }
 
-  private showInput(label: string, initial: string, callback: (val: string) => void) {
+  private showInput(label: string, initial: string, callback: (val: string) => void, masked = false) {
     this.view = "input";
     this.inputLabel = label;
     this.inputValue = initial;
+    this.inputMasked = masked;
     this.inputCallback = callback;
   }
 
@@ -413,9 +436,15 @@ export class HaUi {
     if (this.view === "input") {
       container.addChild(new Text(theme.fg("accent", theme.bold(` ${this.inputLabel} `)), 1, 0));
       container.addChild(new Spacer(1));
-      container.addChild(new Text(`> ${this.inputValue}${CURSOR_MARKER}\x1b[7m \x1b[27m`, 1, 0));
+      const displayValue = this.inputMasked && !this.inputValue.startsWith("!")
+        ? "*".repeat(this.inputValue.length)
+        : this.inputValue;
+      container.addChild(new Text(`> ${displayValue}${CURSOR_MARKER}\x1b[7m \x1b[27m`, 1, 0));
       container.addChild(new Spacer(1));
-      container.addChild(new Text(theme.fg("dim", " enter confirm • esc cancel "), 1, 0));
+      const hint = this.inputMasked
+        ? " enter confirm • esc cancel  (prefix with ! for shell command) "
+        : " enter confirm • esc cancel ";
+      container.addChild(new Text(theme.fg("dim", hint), 1, 0));
     } else if (this.view === "confirm") {
       container.addChild(new Text(theme.fg("warning", theme.bold(" Confirmation Needed ")), 1, 0));
       container.addChild(new Spacer(1));
