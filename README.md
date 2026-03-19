@@ -2,11 +2,30 @@
 
 **pi-high-availability** automatically switches to fallback LLM providers when your primary provider hits quota limits or capacity constraints. Never get stuck waiting for quota resets again.
 
-## 🆕 What's New in v2.2.0
+## 🆕 What's New in v2.3.0
 
 ---
 
-**Per-Session Group Selection** — You can now specify which HA group to use for a `--ha-group` CLI flag. This is useful when running multiple pi instances with different failover chains.
+**Password-Store Integration** — You can now use `!pass` references for API keys stored in [password-store](https://www.passwordstore.org/). The `/ha` UI automatically discovers matching pass entries and shows them as one-click options. API key input is now masked with a hint for `!pass` syntax.
+
+### Usage
+
+```bash
+# In /ha UI, you'll see matching pass entries like:
+#   🔑 Use: api/anthropic/key
+# Click to add as a credential
+
+# Or manually enter:
+!pass show api/anthropic/key
+```
+
+The `!pass` reference is stored in `auth.json` and resolved by pi at API call time.
+
+---
+
+## v2.2.0
+
+**Per-Session Group Selection** — You can now specify which HA group to use via the `--ha-group` CLI flag. This is useful when running multiple pi instances with different failover chains.
 
 ### Usage
 
